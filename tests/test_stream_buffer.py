@@ -2,6 +2,7 @@
 
 import asyncio
 from datetime import datetime, timedelta
+import importlib
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
@@ -106,8 +107,9 @@ async def test_two_cameras_first_succeeds_second_fails_retains_first():
         return None
 
     manager = StreamBufferManager(hass, entry)
-    with patch(
-        "homeassistant.components.camera.get_camera_from_entity_id",
+    with patch.object(
+        importlib.import_module("homeassistant.components.camera"),
+        "get_camera_from_entity_id",
         side_effect=_get_camera,
     ):
         await manager.async_start()
@@ -147,8 +149,9 @@ async def test_two_cameras_second_cancelled_rolls_back_all():
         return None
 
     manager = StreamBufferManager(hass, entry)
-    with patch(
-        "homeassistant.components.camera.get_camera_from_entity_id",
+    with patch.object(
+        importlib.import_module("homeassistant.components.camera"),
+        "get_camera_from_entity_id",
         side_effect=_get_camera,
     ):
         task = asyncio.create_task(manager.async_start())
@@ -179,8 +182,10 @@ async def test_original_preload_true_preserved():
     camera = Mock(async_create_stream=AsyncMock(return_value=stream))
 
     manager = StreamBufferManager(hass, entry)
-    with patch(
-        "homeassistant.components.camera.get_camera_from_entity_id", return_value=camera
+    with patch.object(
+        importlib.import_module("homeassistant.components.camera"),
+        "get_camera_from_entity_id",
+        return_value=camera,
     ):
         await manager.async_start()
 
@@ -203,8 +208,10 @@ async def test_original_preload_false_restored_and_idle_timer_started():
     camera = Mock(async_create_stream=AsyncMock(return_value=stream))
 
     manager = StreamBufferManager(hass, entry)
-    with patch(
-        "homeassistant.components.camera.get_camera_from_entity_id", return_value=camera
+    with patch.object(
+        importlib.import_module("homeassistant.components.camera"),
+        "get_camera_from_entity_id",
+        return_value=camera,
     ):
         await manager.async_start()
 

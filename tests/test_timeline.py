@@ -1462,25 +1462,52 @@ class TestFrameOwnershipLifecycle:
 
         # Create expired event (5 days old with retention=2)
         past = now - datetime.timedelta(days=5)
-        await tl.create_event(
-            start=past,
-            end=past + datetime.timedelta(minutes=1),
-            title="Old expired event",
-            description="",
-            key_frame=str(exp_kf),
-            camera_name="camera1",
-            label="person",
-            saved_frames=[str(exp_kf), str(exp_sf)],
-        )
-        exp_uid = next(e.uid for e in tl.events if e.title == "Old expired event")
+        orig_migrating = getattr(tl, "_migrating", False)
+        tl._migrating = True
+        try:
+            await tl.create_event(
+                start=past,
+                end=past + datetime.timedelta(minutes=1),
+                title="Old expired event",
+                description="",
+                key_frame=str(exp_kf),
+                camera_name="camera1",
+                label="person",
+                saved_frames=[str(exp_kf), str(exp_sf)],
+            )
+            exp_uid = next(e.uid for e in tl.events if e.title == "Old expired event")
+        finally:
+            tl._migrating = orig_migrating
+
+        # Verify files and SQLite events + event_images rows exist before purge
+        assert exp_kf.exists()
+        assert exp_sf.exists()
+        async with aiosqlite.connect(tl._db_path) as db:
+            async with db.execute(
+                "SELECT 1 FROM events WHERE uid = ?", (exp_uid,)
+            ) as cur:
+                assert await cur.fetchone() is not None
+            async with db.execute(
+                "SELECT 1 FROM event_images WHERE event_uid = ?", (exp_uid,)
+            ) as cur:
+                assert await cur.fetchone() is not None
 
         # Load events triggers _purge_expired_events
-        tl._migrating = False
         await tl.load_events()
 
+        # Verify files removed and SQLite events + event_images rows absent after purge
         assert not exp_kf.exists()
         assert not exp_sf.exists()
         assert await tl.get_event(exp_uid) is None
+        async with aiosqlite.connect(tl._db_path) as db:
+            async with db.execute(
+                "SELECT 1 FROM events WHERE uid = ?", (exp_uid,)
+            ) as cur:
+                assert await cur.fetchone() is None
+            async with db.execute(
+                "SELECT 1 FROM event_images WHERE event_uid = ?", (exp_uid,)
+            ) as cur:
+                assert await cur.fetchone() is None
 
     async def test_shared_assets_not_prematurely_removed_and_outside_root_preserved(
         self, build_timeline, tmp_path

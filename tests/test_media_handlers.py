@@ -1,4 +1,5 @@
 """Unit tests for media_handlers.py module."""
+import asyncio
 import os
 import io
 import base64
@@ -7,6 +8,7 @@ from unittest.mock import Mock, patch, AsyncMock, MagicMock
 from PIL import Image
 from types import SimpleNamespace
 from homeassistant.exceptions import ServiceValidationError
+from custom_components.llmvision.const import DOMAIN
 from custom_components.llmvision.media_handlers import MediaProcessor
 
 
@@ -70,6 +72,7 @@ class TestMediaProcessor:
     def mock_hass(self):
         """Create a mock Home Assistant instance."""
         hass = Mock()
+        hass.data = {}
         hass.loop = Mock()
         hass.loop.run_in_executor = AsyncMock()
         hass.states = Mock()
@@ -908,7 +911,7 @@ class TestMediaProcessor:
             elif entity == "camera.cam2":
                 nonlocal cam2_cancelled
                 try:
-                    await asyncio.sleep(2.0)
+                    await asyncio.Event().wait()
                 except asyncio.CancelledError:
                     cam2_cancelled = True
                     raise
@@ -1188,7 +1191,7 @@ class TestMediaProcessor:
         mock_stream.remove_provider = AsyncMock()
         mock_stream.stop = Mock()
 
-        processor.hass.data["llmvision"] = {"active_streams": {"camera.cam2": mock_stream}}
+        processor.hass.data[DOMAIN] = {"active_streams": {"camera.cam2": mock_stream}}
         processor.hass.states.get.side_effect = lambda entity: SimpleNamespace(
             attributes={"friendly_name": entity}
         )
@@ -1235,7 +1238,7 @@ class TestMediaProcessor:
         mock_stream.remove_provider = AsyncMock()
         mock_stream.stop = Mock()
 
-        processor.hass.data["llmvision"] = {"active_streams": {"camera.cam2": mock_stream}}
+        processor.hass.data[DOMAIN] = {"active_streams": {"camera.cam2": mock_stream}}
         processor.hass.states.get.side_effect = lambda entity: SimpleNamespace(
             attributes={"friendly_name": entity}
         )

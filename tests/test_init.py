@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 from dataclasses import dataclass
+import importlib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -809,8 +810,9 @@ class TestSetupServices:
 
         with (
             patch("custom_components.llmvision.Timeline._cleanup", new=AsyncMock()),
-            patch(
-                "homeassistant.components.camera.get_camera_from_entity_id",
+            patch.object(
+                importlib.import_module("homeassistant.components.camera"),
+                "get_camera_from_entity_id",
                 return_value=mock_camera,
             ),
         ):
