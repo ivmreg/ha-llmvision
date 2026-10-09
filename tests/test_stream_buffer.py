@@ -329,6 +329,92 @@ def test_core_hls_lookback_24s_23s_25s_and_stream_id_mismatch():
         manager.validate_lookback(["camera.front"], 24)
 
 
+def test_validate_lookback_initial_none_recovers_via_core_stream_const():
+    """Verify that if module-global MAX_SEGMENTS was None at startup, validate_lookback retries and recovers from Core stream.const."""
+    hass = Mock()
+    entry = _make_entry(["camera.front"], buffer_seconds=30)
+
+    stream, hls = _make_mock_stream(preload_stream=True)
+    hls.target_duration = 6.0
+    now = dt_util.utcnow()
+
+    segments = [
+        DummySegment(duration=6.0, stream_id=1, sequence=1, start_time=now - timedelta(seconds=25)),
+        DummySegment(duration=6.0, stream_id=1, sequence=2, start_time=now - timedelta(seconds=19)),
+        DummySegment(duration=6.0, stream_id=1, sequence=3, start_time=now - timedelta(seconds=13)),
+        DummySegment(duration=6.0, stream_id=1, sequence=4, start_time=now - timedelta(seconds=7)),
+        DummySegment(duration=0.0, stream_id=1, sequence=5, start_time=now - timedelta(seconds=1)),
+    ]
+    hls.get_segments = Mock(return_value=segments)
+
+    manager = StreamBufferManager(hass, entry)
+    manager.is_active = True
+    manager.leases["camera.front"] = CameraStreamLease(
+        camera_entity="camera.front",
+        stream=stream,
+        provider=hls,
+        original_preload=True,
+        borrowed_provider=True,
+    )
+
+    # 1. 0s lookback early-returns before attempting capability import
+    with patch("custom_components.llmvision.stream_buffer.MAX_SEGMENTS", None):
+        manager.validate_lookback(["camera.front"], 0)
+
+    # 2. Positive lookback retries import of real Core stream.const.MAX_SEGMENTS
+    with patch("custom_components.llmvision.stream_buffer.MAX_SEGMENTS", None):
+        manager.validate_lookback(["camera.front"], 24)
+
+
+def test_validate_lookback_simulated_import_error_raises_service_validation_error():
+    """Verify that when native Core stream MAX_SEGMENTS cannot be imported, positive lookback raises ServiceValidationError without frame processing."""
+    hass = Mock()
+    entry = _make_entry(["camera.front"], buffer_seconds=30)
+
+    stream, hls = _make_mock_stream(preload_stream=True)
+    hls.target_duration = 6.0
+    now = dt_util.utcnow()
+
+    segments = [
+        DummySegment(duration=6.0, stream_id=1, sequence=1, start_time=now - timedelta(seconds=25)),
+        DummySegment(duration=6.0, stream_id=1, sequence=2, start_time=now - timedelta(seconds=19)),
+        DummySegment(duration=6.0, stream_id=1, sequence=3, start_time=now - timedelta(seconds=13)),
+        DummySegment(duration=6.0, stream_id=1, sequence=4, start_time=now - timedelta(seconds=7)),
+        DummySegment(duration=0.0, stream_id=1, sequence=5, start_time=now - timedelta(seconds=1)),
+    ]
+    hls.get_segments = Mock(return_value=segments)
+
+    manager = StreamBufferManager(hass, entry)
+    manager.is_active = True
+    manager.leases["camera.front"] = CameraStreamLease(
+        camera_entity="camera.front",
+        stream=stream,
+        provider=hls,
+        original_preload=True,
+        borrowed_provider=True,
+    )
+
+    import builtins
+    orig_import = builtins.__import__
+
+    def _import_intercept(name, *args, **kwargs):
+        if name == "homeassistant.components.stream.const":
+            raise ImportError("Simulated missing stream.const capability")
+        return orig_import(name, *args, **kwargs)
+
+    with patch("custom_components.llmvision.stream_buffer.MAX_SEGMENTS", None):
+        with patch("builtins.__import__", side_effect=_import_intercept):
+            # 0s lookback still early returns without error
+            manager.validate_lookback(["camera.front"], 0)
+
+            # Positive lookback fails capability guard explicitly
+            with pytest.raises(
+                ServiceValidationError,
+                match="Home Assistant stream component MAX_SEGMENTS capability is unavailable.",
+            ):
+                manager.validate_lookback(["camera.front"], 24)
+
+
 def test_services_yaml_max_tokens_and_lookback_selectors():
     """Regression test ensuring max_tokens selector is number in all services and lookback is only in stream_analyzer."""
     import yaml

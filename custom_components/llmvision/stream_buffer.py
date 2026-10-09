@@ -396,10 +396,16 @@ class StreamBufferManager:
             return
 
         # 2. Check Core MAX_SEGMENTS capability
-        if MAX_SEGMENTS is None:
-            raise ServiceValidationError(
-                "Home Assistant stream component MAX_SEGMENTS capability is unavailable."
-            )
+        max_segments = MAX_SEGMENTS
+        if max_segments is None:
+            try:
+                from homeassistant.components.stream.const import (
+                    MAX_SEGMENTS as max_segments,
+                )
+            except ImportError as err:
+                raise ServiceValidationError(
+                    "Home Assistant stream component MAX_SEGMENTS capability is unavailable."
+                ) from err
 
         # 3. Runtime manager activity check
         if not self.is_active:
@@ -485,7 +491,7 @@ class StreamBufferManager:
                 getattr(current_hls, "target_duration", 6.0) or 6.0
             )
             selected_count = min(
-                int(lookback_val / target_duration) + 1, MAX_SEGMENTS
+                int(lookback_val / target_duration) + 1, max_segments
             )
 
             # Slice exact prepended segments from Core formula
