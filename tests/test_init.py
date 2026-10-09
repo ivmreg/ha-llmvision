@@ -787,8 +787,9 @@ class TestSetupServices:
             await handlers["video_analyzer"](data_call)
 
     @pytest.mark.anyio
-    async def test_stream_keeper_setup_and_unload(self):
+    async def test_stream_keeper_setup_and_unload(self, tmp_path):
         hass = _make_hass()
+        hass.config.path.side_effect = lambda *parts: str(tmp_path.joinpath(*parts))
         mock_camera = Mock()
         mock_stream = Mock()
         mock_stream.dynamic_stream_settings = Mock(preload_stream=False)
@@ -810,6 +811,7 @@ class TestSetupServices:
 
         with (
             patch("custom_components.llmvision.Timeline._cleanup", new=AsyncMock()),
+            patch("custom_components.llmvision.timeline.os.makedirs"),
             patch.object(
                 importlib.import_module("homeassistant.components.camera"),
                 "get_camera_from_entity_id",
