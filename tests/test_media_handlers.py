@@ -86,18 +86,23 @@ class TestMediaProcessor:
         return client
 
     @pytest.fixture
-    def processor(self, mock_hass, mock_client):
+    def processor(self, mock_hass, mock_client, tmp_path):
         """Create a MediaProcessor instance."""
         with patch('custom_components.llmvision.media_handlers.async_get_clientsession'):
-            return MediaProcessor(mock_hass, mock_client)
+            proc = MediaProcessor(mock_hass, mock_client)
+            proc.snapshots_path = str(tmp_path / "snapshots") + "/"
+            return proc
 
-    def test_init(self, processor, mock_hass, mock_client):
+    def test_init(self, mock_hass, mock_client):
         """Test MediaProcessor initialization."""
+        with patch('custom_components.llmvision.media_handlers.async_get_clientsession'):
+            processor = MediaProcessor(mock_hass, mock_client)
         assert processor.hass == mock_hass
         assert processor.client == mock_client
         assert processor.base64_images == []
         assert processor.filenames == []
         assert processor.key_frame == ""
+        assert processor.snapshots_path == "/media/llmvision/snapshots/"
 
     @pytest.mark.asyncio
     async def test_encode_image(self, processor):
@@ -846,20 +851,14 @@ class TestMediaProcessor:
         processor.add_video.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_record_with_lookback_failure_falls_back_to_polling(self, processor):
-        """record should catch exception from _record_with_lookback and fall back to snapshot loop."""
+    async def test_record_with_positive_lookback_failure_raises_never_falls_back(self, processor):
+        """record should raise ServiceValidationError when lookback > 0 fails, never falling back to snapshot loop."""
         processor._record_with_lookback = AsyncMock(
-            side_effect=Exception("Stream unreachable")
+            side_effect=ServiceValidationError("Stream unreachable")
         )
-        processor.hass.states.get.return_value = None  # to exit snapshot loop cleanly
+        processor.hass.states.get = Mock()
 
-        with (
-            patch(
-                "custom_components.llmvision.media_handlers.get_url",
-                return_value="http://ha.local",
-            ),
-            pytest.raises(ServiceValidationError, match="No cameras available"),
-        ):
+        with pytest.raises(ServiceValidationError, match="Stream unreachable"):
             await processor.record(
                 image_entities=["camera.front_porch"],
                 duration=1,
@@ -871,6 +870,8 @@ class TestMediaProcessor:
             )
 
         processor._record_with_lookback.assert_awaited_once()
+        # Verify that snapshot polling was never attempted
+        assert processor.hass.states.get.call_count == 0
 
     @pytest.mark.asyncio
     async def test_add_visual_data_delegates_to_add_images(self, processor):
@@ -887,3 +888,381 @@ class TestMediaProcessor:
 
         assert result is processor.client
         processor.add_images.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_record_lookback_sibling_cancellation_and_cleanup_on_error(
+        self, processor, tmp_path
+    ):
+        """Multi-camera lookback must cancel and join sibling tasks on early error and cleanup temp files."""
+        processor.snapshots_path = str(tmp_path / "snapshots") + "/"
+        cam2_cancelled = False
+
+        processor.hass.states.get.side_effect = lambda entity: SimpleNamespace(
+            attributes={"friendly_name": entity}
+        )
+
+        async def fake_async_call(domain, service, data, blocking=True):
+            entity = data["entity_id"]
+            if entity == "camera.cam1":
+                raise ServiceValidationError("Camera 1 stream unreachable")
+            elif entity == "camera.cam2":
+                nonlocal cam2_cancelled
+                try:
+                    await asyncio.sleep(2.0)
+                except asyncio.CancelledError:
+                    cam2_cancelled = True
+                    raise
+
+        processor.hass.services = Mock()
+        processor.hass.services.async_call = fake_async_call
+
+        with patch(
+            "custom_components.llmvision.media_handlers.get_url",
+            return_value="http://ha.local",
+        ), pytest.raises(ServiceValidationError, match="Camera 1 stream unreachable"):
+            await processor.record(
+                image_entities=["camera.cam1", "camera.cam2"],
+                duration=2,
+                max_frames=2,
+                target_width=128,
+                include_filename=False,
+                expose_images=False,
+                lookback=5,
+            )
+
+        # Sibling task for Camera 2 must have been cancelled
+        assert cam2_cancelled is True
+        # No temp files remaining in snapshots_path
+        if os.path.exists(processor.snapshots_path):
+            temp_files = [
+                f for f in os.listdir(processor.snapshots_path) if f.startswith("temp_lookback_")
+            ]
+            assert len(temp_files) == 0
+
+    @pytest.mark.asyncio
+    async def test_add_videos_deterministic_input_order_and_keyframe(
+        self, processor, tmp_path
+    ):
+        """add_videos must execute real add_video sequentially in input order and resolve keyframes per-video locally."""
+        processor.snapshots_path = str(tmp_path / "snapshots") + "/"
+        processor.hass.loop.run_in_executor.side_effect = (
+            lambda _executor, func, *args: func(*args)
+        )
+
+        v1_frames = [_make_jpeg_bytes((10, 10, i * 50)) for i in range(3)]
+        v2_frames = [_make_jpeg_bytes((200, 200, i * 50)) for i in range(2)]
+
+        class FakeStdout:
+            def __init__(self, chunks):
+                self._chunks = list(chunks)
+
+            async def read(self, _size):
+                if self._chunks:
+                    return self._chunks.pop(0)
+                return b""
+
+        class FakeProcess:
+            def __init__(self, frames):
+                self.pid = 101
+                self.stdout = FakeStdout([b"".join(frames), b""])
+                self.stderr = None
+                self.returncode = 0
+
+            async def wait(self):
+                return self.returncode
+
+        async def fake_create_subprocess_exec(*args, **kwargs):
+            cmd_str = " ".join(args)
+            if "clip1.mp4" in cmd_str:
+                return FakeProcess(v1_frames)
+            else:
+                return FakeProcess(v2_frames)
+
+        processor._select_keyframe_index = AsyncMock(side_effect=[1, 0])
+        processor._similarity_score = Mock(return_value=0.5)
+        processor.resize_image = AsyncMock(
+            side_effect=lambda target_width, image_data=None, **kw: base64.b64encode(image_data or b"").decode("utf-8")
+        )
+
+        with patch(
+            "custom_components.llmvision.media_handlers.get_url",
+            return_value="http://ha.local",
+        ), patch(
+            "custom_components.llmvision.media_handlers.asyncio.create_subprocess_exec",
+            fake_create_subprocess_exec,
+        ):
+            await processor.add_videos(
+                video_paths=["/media/clip1.mp4", "/media/clip2.mp4"],
+                event_ids=[],
+                max_frames=3,
+                target_width=128,
+                include_filename=False,
+                expose_images=True,
+            )
+
+        assert len(processor.saved_frames) == 5
+        assert all("clip1-frame_" in f for f in processor.saved_frames[:3])
+        assert all("clip2-frame_" in f for f in processor.saved_frames[3:])
+
+        clip1_keyframe = processor.saved_frames[1]
+        assert "clip1-frame_2" in clip1_keyframe
+
+        clip2_keyframe = processor.saved_frames[3]
+        assert "clip2-frame_1" in clip2_keyframe
+        assert processor.key_frame == clip2_keyframe
+
+    @pytest.mark.asyncio
+    async def test_path_separators_sanitization_and_write_failure_state(
+        self, processor, tmp_path
+    ):
+        """Friendly names must keep readable LLM labels, while filesystem paths sanitize all separators; write failures must not alter bookkeeping."""
+        processor.snapshots_path = str(tmp_path / "snapshots") + "/"
+        encoded_img = base64.b64encode(b"fake-image").decode("utf-8")
+
+        frame_bytes = [_make_jpeg_bytes("blue")]
+
+        class FakeStdout:
+            def __init__(self, chunks):
+                self._chunks = list(chunks)
+
+            async def read(self, _size):
+                if self._chunks:
+                    return self._chunks.pop(0)
+                return b""
+
+        class FakeProcess:
+            def __init__(self):
+                self.pid = 99
+                self.stdout = FakeStdout([b"".join(frame_bytes), b""])
+                self.stderr = None
+                self.returncode = 0
+
+            async def wait(self):
+                return self.returncode
+
+        processor.resize_image = AsyncMock(return_value=encoded_img)
+        processor._select_keyframe_index = AsyncMock(return_value=0)
+        exposed_names = []
+
+        real_expose = processor._expose_image
+
+        async def track_expose(frame_name, image_data, uid, frame_path=None):
+            exposed_names.append(frame_name)
+            return await real_expose(frame_name, image_data, uid, frame_path=frame_path)
+
+        processor._expose_image = track_expose
+
+        with patch(
+            "custom_components.llmvision.media_handlers.asyncio.create_subprocess_exec",
+            AsyncMock(return_value=FakeProcess()),
+        ):
+            await processor.add_video(
+                video_path="/media/test.mp4",
+                base_url="http://ha.local",
+                max_frames=1,
+                target_width=128,
+                include_filename=True,
+                expose_images=True,
+                override_filename="Front/Porch/Cam:1\\2",
+            )
+
+        assert (
+            processor.client.add_frame.call_args.kwargs["filename"]
+            == "Front/Porch/Cam:1\\2 (frame 1)"
+        )
+        assert len(exposed_names) == 1
+        assert "/" not in exposed_names[0]
+        assert "\\" not in exposed_names[0]
+        assert ":" not in exposed_names[0]
+        assert "Front_Porch_Cam_1_2" in exposed_names[0]
+
+        processor.saved_frames.clear()
+        processor.key_frame = ""
+        processor._save_clip = AsyncMock(side_effect=IOError("Disk write failed"))
+
+        with pytest.raises(IOError, match="Disk write failed"):
+            await real_expose("failed_frame", encoded_img, "bad12345")
+
+        assert len(processor.saved_frames) == 0
+        assert processor.key_frame == ""
+
+    @pytest.mark.asyncio
+    async def test_late_motion_under_bounded_candidates(self, processor):
+        """Candidate frame bounding must drain entire clip to EOF (80+ frames), bound heap to cap 30, and select late motion frames."""
+        processor.hass.loop.run_in_executor.side_effect = (
+            lambda _executor, func, *args: func(*args)
+        )
+        total_frames = 85
+        frame_bytes = [
+            _make_jpeg_bytes((i * 3 % 256, (i * 7 + 10) % 256, (i * 11 + 20) % 256))
+            for i in range(total_frames)
+        ]
+
+        class FakeStdout:
+            def __init__(self, chunks):
+                self._chunks = list(chunks)
+
+            async def read(self, _size):
+                if self._chunks:
+                    return self._chunks.pop(0)
+                return b""
+
+        class FakeProcess:
+            def __init__(self):
+                self.pid = 88
+                self.stdout = FakeStdout([b"".join(frame_bytes), b""])
+                self.stderr = None
+                self.returncode = 0
+
+            async def wait(self):
+                return self.returncode
+
+        scores = [0.95] * 60 + [0.05 + (i * 0.005) for i in range(24)]
+        processor._similarity_score = Mock(side_effect=scores)
+
+        added_frames = []
+        processor.client.add_frame = Mock(
+            side_effect=lambda base64_image, filename: added_frames.append((base64_image, filename))
+        )
+        processor.resize_image = AsyncMock(
+            side_effect=lambda target_width, image_data=None, **kw: base64.b64encode(image_data or b"").decode("utf-8")
+        )
+
+        with patch(
+            "custom_components.llmvision.media_handlers.asyncio.create_subprocess_exec",
+            AsyncMock(return_value=FakeProcess()),
+        ):
+            await processor.add_video(
+                video_path="/media/long_clip.mp4",
+                base_url="http://ha.local",
+                max_frames=3,
+                target_width=128,
+                include_filename=False,
+                expose_images=False,
+            )
+
+        assert processor._similarity_score.call_count == 84
+        assert len(added_frames) == 3
+
+        first_encoded = base64.b64encode(frame_bytes[0]).decode("utf-8")
+        assert added_frames[0][0] == first_encoded
+        assert added_frames[0][1] == "Video frame 1"
+
+        late_encoded = [base64.b64encode(b).decode("utf-8") for b in frame_bytes[61:]]
+        assert added_frames[1][0] in late_encoded
+        assert added_frames[2][0] in late_encoded
+
+    @pytest.mark.asyncio
+    async def test_record_zero_lookback_unchanged(self, processor):
+        """record with lookback=0 must execute standard snapshot polling and never call _record_with_lookback."""
+        processor._record_with_lookback = AsyncMock()
+        processor.hass.states.get.return_value = None
+
+        with patch(
+            "custom_components.llmvision.media_handlers.get_url",
+            return_value="http://ha.local",
+        ), pytest.raises(ServiceValidationError, match="No cameras available"):
+            await processor.record(
+                image_entities=["camera.front"],
+                duration=1,
+                max_frames=2,
+                target_width=128,
+                include_filename=False,
+                expose_images=False,
+                lookback=0,
+            )
+
+        processor._record_with_lookback.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_lookback_cancellation_releases_only_matching_owned_recorder(
+        self, processor, tmp_path
+    ):
+        """When cancelled, only the matching owned RecorderOutput provider is removed; HLS and stream remain intact."""
+        processor.snapshots_path = str(tmp_path / "snapshots") + "/"
+
+        mock_recorder = SimpleNamespace(name="recorder", video_path="")
+        mock_hls = SimpleNamespace(name="hls")
+        mock_stream = Mock()
+        mock_stream.outputs = Mock(return_value={"recorder": mock_recorder, "hls": mock_hls})
+        mock_stream.remove_provider = AsyncMock()
+        mock_stream.stop = Mock()
+
+        processor.hass.data["llmvision"] = {"active_streams": {"camera.cam2": mock_stream}}
+        processor.hass.states.get.side_effect = lambda entity: SimpleNamespace(
+            attributes={"friendly_name": entity}
+        )
+
+        async def fake_async_call(domain, service, data, blocking=True):
+            entity = data["entity_id"]
+            if entity == "camera.cam1":
+                raise ServiceValidationError("Camera 1 stream unreachable")
+            elif entity == "camera.cam2":
+                mock_recorder.video_path = data["filename"]
+                await asyncio.sleep(10.0)
+
+        processor.hass.services = Mock()
+        processor.hass.services.async_call = fake_async_call
+
+        with patch(
+            "custom_components.llmvision.media_handlers.get_url",
+            return_value="http://ha.local",
+        ), pytest.raises(ServiceValidationError, match="Camera 1 stream unreachable"):
+            await processor.record(
+                image_entities=["camera.cam1", "camera.cam2"],
+                duration=2,
+                max_frames=2,
+                target_width=128,
+                include_filename=False,
+                expose_images=False,
+                lookback=5,
+            )
+
+        mock_stream.remove_provider.assert_awaited_once_with(mock_recorder)
+        assert mock_hls not in [call.args[0] for call in mock_stream.remove_provider.await_args_list]
+        mock_stream.stop.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_lookback_cancellation_preserves_borrowed_mismatched_recorder(
+        self, processor, tmp_path
+    ):
+        """When cancelled, mismatched/borrowed recorder provider is NEVER removed."""
+        processor.snapshots_path = str(tmp_path / "snapshots") + "/"
+
+        borrowed_recorder = SimpleNamespace(name="recorder", video_path="/other/recording.mp4")
+        mock_stream = Mock()
+        mock_stream.outputs = Mock(return_value={"recorder": borrowed_recorder})
+        mock_stream.remove_provider = AsyncMock()
+        mock_stream.stop = Mock()
+
+        processor.hass.data["llmvision"] = {"active_streams": {"camera.cam2": mock_stream}}
+        processor.hass.states.get.side_effect = lambda entity: SimpleNamespace(
+            attributes={"friendly_name": entity}
+        )
+
+        async def fake_async_call(domain, service, data, blocking=True):
+            entity = data["entity_id"]
+            if entity == "camera.cam1":
+                raise ServiceValidationError("Camera 1 failed")
+            elif entity == "camera.cam2":
+                await asyncio.sleep(10.0)
+
+        processor.hass.services = Mock()
+        processor.hass.services.async_call = fake_async_call
+
+        with patch(
+            "custom_components.llmvision.media_handlers.get_url",
+            return_value="http://ha.local",
+        ), pytest.raises(ServiceValidationError, match="Camera 1 failed"):
+            await processor.record(
+                image_entities=["camera.cam1", "camera.cam2"],
+                duration=2,
+                max_frames=2,
+                target_width=128,
+                include_filename=False,
+                expose_images=False,
+                lookback=5,
+            )
+
+        mock_stream.remove_provider.assert_not_called()
+        mock_stream.stop.assert_not_called()

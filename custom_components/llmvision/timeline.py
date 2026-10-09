@@ -14,7 +14,8 @@ import logging
 
 _LOGGER = logging.getLogger(__name__)
 
-DB_VERSION = 4
+DB_VERSION = 5
+DATA_TIMELINE_MUTATION_LOCKS = "llmvision_timeline_mutation_locks"
 
 
 async def _get_category_and_label(
@@ -178,6 +179,7 @@ class Event:
         camera_name: str,
         category: str,
         label: str,
+        saved_frames: list[str] | None = None,
     ):
         self.uid = uid
         self.title = title
@@ -188,9 +190,18 @@ class Event:
         self.camera_name = camera_name
         self.category = category
         self.label = label
+        if saved_frames is not None:
+            frames = list(saved_frames)
+            if key_frame and key_frame not in frames:
+                frames.append(key_frame)
+            self.saved_frames = frames
+        elif key_frame:
+            self.saved_frames = [key_frame]
+        else:
+            self.saved_frames = []
 
     def __repr__(self):
-        return f"Event(uid={self.uid}, title={self.title}, start={self.start}, end={self.end}, description={self.description}, key_frame={self.key_frame}, camera_name={self.camera_name}, category={self.category}, label={self.label})"
+        return f"Event(uid={self.uid}, title={self.title}, start={self.start}, end={self.end}, description={self.description}, key_frame={self.key_frame}, camera_name={self.camera_name}, category={self.category}, label={self.label}, saved_frames={self.saved_frames})"
 
     def __str__(self):
         return self.__repr__()
@@ -208,7 +219,7 @@ class Timeline:
 
         # Track key_frame paths whose DB rows are not yet committed
         self._pending_key_frames: set[str] = set()
-        self._cleanup_lock = asyncio.Lock()
+        self._fallback_lock = asyncio.Lock()
         self._config_entry = config_entry
         self._migrating = True
 
@@ -222,6 +233,33 @@ class Timeline:
         self.hass.async_create_task(self._migrate())
         self.hass.async_create_task(self.load_events())
         self.hass.async_create_task(self._cleanup())
+
+    def _get_mutation_lock(self) -> asyncio.Lock:
+        """Return the shared mutation lock for this hass instance and db_path."""
+        if not hasattr(self.hass, "data") or not isinstance(self.hass.data, dict):
+            return self._fallback_lock
+        locks = self.hass.data.setdefault(DATA_TIMELINE_MUTATION_LOCKS, {})
+        canonical_db = os.path.normcase(os.path.abspath(self._db_path))
+        if canonical_db not in locks:
+            locks[canonical_db] = asyncio.Lock()
+        return locks[canonical_db]
+
+    @property
+    def _cleanup_lock(self) -> asyncio.Lock:
+        return self._get_mutation_lock()
+
+    @_cleanup_lock.setter
+    def _cleanup_lock(self, val: asyncio.Lock) -> None:
+        self._fallback_lock = val
+
+    def _normalize_image_path(self, path: str) -> str:
+        """Normalize internal image path for canonical comparison and ownership."""
+        if not path or not isinstance(path, str):
+            return ""
+        try:
+            return os.path.normcase(os.path.realpath(os.path.abspath(path)))
+        except (ValueError, OSError):
+            return os.path.normcase(os.path.normpath(path))
 
     async def _get_db_version(self) -> int:
         """Return PRAGMA user_version (0 if unset)."""
@@ -246,7 +284,7 @@ class Timeline:
             _LOGGER.warning(f"Failed to set DB user_version to {version}: {e}")
 
     async def _has_latest_schema(self) -> bool:
-        """Checks if the events table matches the latest schema columns."""
+        """Checks if the events and event_images tables match the latest schema."""
         expected = {
             "uid",
             "title",
@@ -262,7 +300,14 @@ class Timeline:
             async with aiosqlite.connect(self._db_path) as db:
                 async with db.execute("PRAGMA table_info(events)") as cursor:
                     cols = [r[1] for r in await cursor.fetchall()]
-            return expected.issubset(set(cols))
+                if not expected.issubset(set(cols)):
+                    return False
+                async with db.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='event_images'"
+                ) as cursor:
+                    if not await cursor.fetchone():
+                        return False
+            return True
         except Exception as e:
             _LOGGER.debug(f"Failed to inspect DB schema: {e}")
             return False
@@ -289,6 +334,19 @@ class Timeline:
                 """)
                 await db.execute("""
                     CREATE INDEX IF NOT EXISTS idx_end ON events (end)
+                """)
+                await db.execute("""
+                    CREATE TABLE IF NOT EXISTS event_images (
+                        event_uid TEXT,
+                        image_path TEXT,
+                        PRIMARY KEY (event_uid, image_path)
+                    )
+                """)
+                await db.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_event_images_uid ON event_images (event_uid)
+                """)
+                await db.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_event_images_path ON event_images (image_path)
                 """)
                 await db.commit()
         except aiosqlite.Error as e:
@@ -498,6 +556,33 @@ class Timeline:
             except aiosqlite.Error as e:
                 _LOGGER.error(f"Error migrating events.db to v4.3: {e}")
 
+            # v4.3 -> v5: Add event_images table and migrate existing key_frames
+            try:
+                async with aiosqlite.connect(self._db_path) as db:
+                    await db.execute("""
+                        CREATE TABLE IF NOT EXISTS event_images (
+                            event_uid TEXT,
+                            image_path TEXT,
+                            PRIMARY KEY (event_uid, image_path)
+                        )
+                    """)
+                    await db.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_event_images_uid ON event_images (event_uid)
+                    """)
+                    await db.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_event_images_path ON event_images (image_path)
+                    """)
+                    await db.execute("""
+                        INSERT OR IGNORE INTO event_images (event_uid, image_path)
+                        SELECT uid, key_frame FROM events
+                        WHERE key_frame IS NOT NULL AND key_frame != ''
+                    """)
+                    await db.commit()
+                    _LOGGER.info("Timeline DB migration to v5 complete (event_images created)")
+            except aiosqlite.Error as e:
+                _LOGGER.error(f"Error migrating events.db to v5: {e}")
+                return
+
             # Mark migration complete by setting user_version
             await self._set_db_version(DB_VERSION)
             _LOGGER.info(f"DB migration complete (user_version={DB_VERSION})")
@@ -539,8 +624,23 @@ class Timeline:
 
         return days
 
+    def _is_safe_snapshot_path(self, path: str) -> bool:
+        """Returns True if path is safely inside the configured snapshots media directory."""
+        if not path or not isinstance(path, str):
+            return False
+        try:
+            abs_media = os.path.realpath(os.path.abspath(self._media_path))
+            abs_path = os.path.realpath(os.path.abspath(path))
+            common = os.path.commonpath([abs_media, abs_path])
+            return (
+                os.path.normcase(common) == os.path.normcase(abs_media)
+                and os.path.normcase(abs_path) != os.path.normcase(abs_media)
+            )
+        except (ValueError, OSError):
+            return False
+
     async def _purge_expired_events(self) -> None:
-        """Remove events older than now - retention_time days."""
+        """Remove events older than now - retention_time days and unshared media assets."""
         if getattr(self, "_migrating", False):
             return
 
@@ -552,30 +652,120 @@ class Timeline:
         cutoff_local = dt_util.as_local(self._ensure_datetime(cutoff)).isoformat()
 
         try:
-            async with aiosqlite.connect(self._db_path) as db:
-                async with db.execute(
-                    """
-                    SELECT uid, key_frame FROM events
-                    WHERE start IS NOT NULL AND start < ?
-                """,
-                    (cutoff_local,),
-                ) as cursor:
-                    stale_rows = list(await cursor.fetchall())
+            unshared_images_to_delete: list[str] = []
+            async with self._get_mutation_lock():
+                async with aiosqlite.connect(self._db_path) as db:
+                    async with db.execute(
+                        """
+                        SELECT uid, key_frame FROM events
+                        WHERE start IS NOT NULL AND start < ?
+                        """,
+                        (cutoff_local,),
+                    ) as cursor:
+                        stale_rows = list(await cursor.fetchall())
 
-                if not stale_rows:
-                    return
+                    if not stale_rows:
+                        return
 
-                await db.executemany(
-                    "DELETE FROM events WHERE uid = ?",
-                    [(row[0],) for row in stale_rows],
-                )
-                await db.commit()
+                    # Check if event_images table exists
+                    has_event_images = False
+                    async with db.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name='event_images'"
+                    ) as cur:
+                        has_event_images = await cur.fetchone() is not None
 
-                _LOGGER.info(
-                    "Purged %s expired timeline event(s) older than %s day(s)",
-                    len(stale_rows),
-                    retention_days,
-                )
+                    expired_images = set()
+                    for row in stale_rows:
+                        if row[1]:
+                            expired_images.add(row[1])
+
+                    if has_event_images:
+                        async with db.execute(
+                            """
+                            SELECT image_path FROM event_images
+                            WHERE event_uid IN (SELECT uid FROM events WHERE start IS NOT NULL AND start < ?)
+                            """,
+                            (cutoff_local,),
+                        ) as cur:
+                            for img_row in await cur.fetchall():
+                                if img_row[0]:
+                                    expired_images.add(img_row[0])
+
+                    # Fetch surviving events key_frames and event_images
+                    async with db.execute(
+                        """
+                        SELECT key_frame FROM events
+                        WHERE (start IS NULL OR start >= ?) AND key_frame IS NOT NULL AND key_frame != ''
+                        """,
+                        (cutoff_local,),
+                    ) as cur:
+                        surviving_keyframes = {
+                            self._normalize_image_path(r[0])
+                            for r in await cur.fetchall()
+                        }
+
+                    surviving_saved_frames = set()
+                    if has_event_images:
+                        async with db.execute(
+                            """
+                            SELECT ei.image_path FROM event_images ei
+                            JOIN events e ON ei.event_uid = e.uid
+                            WHERE (e.start IS NULL OR e.start >= ?) AND ei.image_path IS NOT NULL AND ei.image_path != ''
+                            """,
+                            (cutoff_local,),
+                        ) as cur:
+                            surviving_saved_frames = {
+                                self._normalize_image_path(r[0])
+                                for r in await cur.fetchall()
+                            }
+
+                    surviving_all = surviving_keyframes | surviving_saved_frames
+
+                    for img in expired_images:
+                        canon_img = self._normalize_image_path(img)
+                        if canon_img and canon_img not in surviving_all:
+                            unshared_images_to_delete.append(img)
+
+                    # Delete associations and events transactionally
+                    if has_event_images:
+                        await db.execute(
+                            """
+                            DELETE FROM event_images
+                            WHERE event_uid IN (SELECT uid FROM events WHERE start IS NOT NULL AND start < ?)
+                            """,
+                            (cutoff_local,),
+                        )
+                    await db.execute(
+                        "DELETE FROM events WHERE start IS NOT NULL AND start < ?",
+                        (cutoff_local,),
+                    )
+                    await db.commit()
+
+                # Remove unshared filesystem assets after DB commit succeeds (still under lock)
+                deleted_canonical = set()
+                for img_path in unshared_images_to_delete:
+                    canon = self._normalize_image_path(img_path)
+                    if canon in deleted_canonical:
+                        continue
+                    if self._is_safe_snapshot_path(img_path):
+                        try:
+                            exists = await self.hass.async_add_executor_job(
+                                os.path.exists, img_path
+                            )
+                            if exists:
+                                await self.hass.async_add_executor_job(
+                                    os.remove, img_path
+                                )
+                                deleted_canonical.add(canon)
+                                _LOGGER.info(f"Purged expired unshared image: {img_path}")
+                        except OSError as e:
+                            _LOGGER.warning(f"Failed to purge expired image {img_path}: {e}")
+
+            _LOGGER.info(
+                "Purged %s expired timeline event(s) older than %s day(s)",
+                len(stale_rows),
+                retention_days,
+            )
         except aiosqlite.Error as e:
             _LOGGER.error(f"Error purging expired timeline events: {e}")
 
@@ -584,13 +774,20 @@ class Timeline:
         return (await _get_category_and_label(self.hass, self._config_entry, label))[0]
 
     async def get_linked_images(self):
-        """Returns the filenames of key_frames associated with events"""
+        """Returns the filenames of all images associated with events"""
         await self.load_events()
-        return [
-            os.path.basename(e.key_frame)
-            for e in self.events
-            if getattr(e, "key_frame", None)
-        ]
+        linked = set()
+        for e in self.events:
+            if getattr(e, "key_frame", None):
+                base = os.path.basename(e.key_frame)
+                if base:
+                    linked.add(base)
+            for frame in getattr(e, "saved_frames", []):
+                if frame:
+                    base = os.path.basename(frame)
+                    if base:
+                        linked.add(base)
+        return list(linked)
 
     async def load_events(self):
         """Loads events from the database into memory"""
@@ -598,6 +795,21 @@ class Timeline:
         self.events = []
         try:
             async with aiosqlite.connect(self._db_path) as db:
+                has_event_images = False
+                async with db.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='event_images'"
+                ) as cursor:
+                    has_event_images = await cursor.fetchone() is not None
+
+                event_frames_map: dict[str, list[str]] = {}
+                if has_event_images:
+                    async with db.execute(
+                        "SELECT event_uid, image_path FROM event_images"
+                    ) as cursor:
+                        for ev_uid, img_path in await cursor.fetchall():
+                            if ev_uid and img_path:
+                                event_frames_map.setdefault(ev_uid, []).append(img_path)
+
                 async with db.execute("""
                     SELECT
                         uid, title, start, end, description,
@@ -621,8 +833,11 @@ class Timeline:
                         if row_end:
                             row_end = self._ensure_datetime(row_end)
 
+                        uid = row[0]
+                        saved_frames = event_frames_map.get(uid)
+
                         event = Event(
-                            uid=row[0],
+                            uid=uid,
                             title=row[1],
                             start=row_start,
                             end=row_end,
@@ -631,6 +846,7 @@ class Timeline:
                             key_frame=row[6],
                             camera_name=row[7],
                             label=row[8],
+                            saved_frames=saved_frames,
                         )
                         self.events.append(event)
         except aiosqlite.Error as e:
@@ -656,6 +872,7 @@ class Timeline:
                     "camera_name": event.camera_name,
                     "category": event.category,
                     "label": event.label,
+                    "saved_frames": getattr(event, "saved_frames", []),
                 }
                 return event_dict
         return None
@@ -785,6 +1002,7 @@ class Timeline:
         key_frame: str,
         camera_name: str,
         label: str = "",
+        saved_frames: list[str] | None = None,
     ) -> None:
         """Adds a new event to calendar"""
         category = ""
@@ -798,19 +1016,23 @@ class Timeline:
         start = dt_util.as_local(start)
         end = dt_util.as_local(end)
 
-        # Mark key_frame as pending so cleanup won't remove it before DB insert
-        pending_name = (
-            (os.path.basename(key_frame) or "").lower() if key_frame else None
-        )
+        # Mark key_frame and saved_frames as pending so cleanup won't remove them before DB insert
+        pending_names = set()
+        if key_frame:
+            base = os.path.basename(key_frame)
+            if base:
+                pending_names.add(base.lower())
+        if saved_frames:
+            for frame in saved_frames:
+                if frame:
+                    base = os.path.basename(frame)
+                    if base:
+                        pending_names.add(base.lower())
 
-        async with self._cleanup_lock:
-            if pending_name:
-                self._pending_key_frames.add(pending_name)
+        async with self._get_mutation_lock():
+            for name in pending_names:
+                self._pending_key_frames.add(name)
             try:
-                # No pre-load needed: the in-memory list is not read before the
-                # insert below, and _insert_event() reloads it afterwards. Skipping
-                # this redundant full-DB reload keeps event creation off the hot path.
-
                 # Resolve category and label if not provided
                 if not label:
                     try:
@@ -839,16 +1061,18 @@ class Timeline:
                     camera_name=camera_name,
                     category=category,
                     label=label,
+                    saved_frames=saved_frames,
                 )
                 _LOGGER.info(f"Creating event: {event}")
                 await self._insert_event(event)
             finally:
                 # Remove from pending once DB insert is done
-                if pending_name:
-                    self._pending_key_frames.discard(pending_name)
+                for name in pending_names:
+                    self._pending_key_frames.discard(name)
+        await self.load_events()
 
     async def _insert_event(self, event: Event) -> None:
-        """Inserts a new event into the database"""
+        """Inserts a new event into the database transactionally."""
         try:
             async with aiosqlite.connect(self._db_path) as db:
                 _LOGGER.info(f"Inserting event into database: {event}")
@@ -871,10 +1095,38 @@ class Timeline:
                         event.label,
                     ),
                 )
+                # Ensure schema ready: create event_images table transactionally
+                await db.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS event_images (
+                        event_uid TEXT,
+                        image_path TEXT,
+                        PRIMARY KEY (event_uid, image_path)
+                    )
+                """
+                )
+                images_to_insert = set()
+                if event.key_frame:
+                    norm_kf = self._normalize_image_path(event.key_frame)
+                    if norm_kf:
+                        images_to_insert.add(norm_kf)
+                for frame in (getattr(event, "saved_frames", None) or []):
+                    if frame:
+                        norm_f = self._normalize_image_path(frame)
+                        if norm_f:
+                            images_to_insert.add(norm_f)
+                if images_to_insert:
+                    await db.executemany(
+                        """
+                        INSERT OR IGNORE INTO event_images (event_uid, image_path)
+                        VALUES (?, ?)
+                        """,
+                        [(event.uid, img) for img in images_to_insert],
+                    )
                 await db.commit()
-                await self.load_events()
-        except aiosqlite.Error as e:
+        except Exception as e:
             _LOGGER.error(f"Error inserting event into database: {e}")
+            raise
 
     async def update_event(
         self,
@@ -886,10 +1138,9 @@ class Timeline:
         key_frame: str,
         camera_name: str,
         label: str,
+        saved_frames: list[str] | None = None,
     ) -> None:
         """Updates an existing event in the calendar."""
-        await self.load_events()
-
         # Ensure dtstart and dtend are datetime objects
         if isinstance(start, str):
             start = datetime.datetime.fromisoformat(start)
@@ -900,28 +1151,70 @@ class Timeline:
         end = dt_util.as_local(end)
 
         try:
-            async with aiosqlite.connect(self._db_path) as db:
-                _LOGGER.info(f"Updating event with UID {uid}")
-                await db.execute(
-                    """
-                    UPDATE events
-                    SET title = ?, start = ?, end = ?, description = ?, key_frame = ?, camera_name = ?, category = ?, label = ?
-                    WHERE uid = ?
-                """,
-                    (
-                        title,
-                        dt_util.as_local(self._ensure_datetime(start)).isoformat(),
-                        dt_util.as_local(self._ensure_datetime(end)).isoformat(),
-                        description,
-                        key_frame,
-                        camera_name,
-                        await self._get_category_from_label(label),
-                        label,
-                        uid,
-                    ),
-                )
-                await db.commit()
-                await self.load_events()
+            async with self._get_mutation_lock():
+                async with aiosqlite.connect(self._db_path) as db:
+                    cursor = await db.execute(
+                        """
+                        UPDATE events
+                        SET title = ?, start = ?, end = ?, description = ?, key_frame = ?, camera_name = ?, category = ?, label = ?
+                        WHERE uid = ?
+                    """,
+                        (
+                            title,
+                            dt_util.as_local(self._ensure_datetime(start)).isoformat(),
+                            dt_util.as_local(self._ensure_datetime(end)).isoformat(),
+                            description,
+                            key_frame,
+                            camera_name,
+                            await self._get_category_from_label(label),
+                            label,
+                            uid,
+                        ),
+                    )
+                    if cursor.rowcount > 0:
+                        await db.execute(
+                            """
+                            CREATE TABLE IF NOT EXISTS event_images (
+                                event_uid TEXT,
+                                image_path TEXT,
+                                PRIMARY KEY (event_uid, image_path)
+                            )
+                        """
+                        )
+                        if saved_frames is not None:
+                            # Explicit replacement list given: replace associations
+                            await db.execute(
+                                "DELETE FROM event_images WHERE event_uid = ?", (uid,)
+                            )
+                            images_to_insert = set()
+                            if key_frame:
+                                norm_kf = self._normalize_image_path(key_frame)
+                                if norm_kf:
+                                    images_to_insert.add(norm_kf)
+                            for f in saved_frames:
+                                if f:
+                                    norm_f = self._normalize_image_path(f)
+                                    if norm_f:
+                                        images_to_insert.add(norm_f)
+                            if images_to_insert:
+                                await db.executemany(
+                                    "INSERT OR IGNORE INTO event_images (event_uid, image_path) VALUES (?, ?)",
+                                    [(uid, img) for img in images_to_insert],
+                                )
+                        elif key_frame:
+                            # Metadata-only update with key_frame: retain untouched existing frames, ensure key_frame is tracked
+                            norm_kf = self._normalize_image_path(key_frame)
+                            if norm_kf:
+                                await db.execute(
+                                    "INSERT OR IGNORE INTO event_images (event_uid, image_path) VALUES (?, ?)",
+                                    (uid, norm_kf),
+                                )
+                        await db.commit()
+                    else:
+                        _LOGGER.warning(
+                            f"Event with UID {uid} not found for update; skipping associations"
+                        )
+            await self.load_events()
         except aiosqlite.Error as e:
             _LOGGER.error(f"Error updating event in database: {e}")
 
@@ -929,41 +1222,100 @@ class Timeline:
         self,
         uid: str,
     ) -> bool:
-        """Deletes an event from the calendar."""
+        """Deletes an event from the calendar and removes unshared assets safely."""
         _LOGGER.info(f"Deleting event with UID: {uid}")
-
-        async def _delete_event_from_db(uid: str) -> bool:
-            """Deletes an event from the database"""
-            try:
+        try:
+            unshared_images_to_delete: list[str] = []
+            async with self._get_mutation_lock():
                 async with aiosqlite.connect(self._db_path) as db:
-                    await db.execute("DELETE FROM events WHERE uid = ?", (uid,))
-                    await db.commit()
-            except aiosqlite.Error as e:
-                _LOGGER.error(f"Error deleting event from database: {e}")
-                return False
-            return True
-
-        async def _delete_image(uid: str) -> bool:
-            """Deletes the image associated with the event"""
-            try:
-                async with aiosqlite.connect(self._db_path) as db:
+                    # 1. Fetch event key_frame
                     async with db.execute(
                         "SELECT key_frame FROM events WHERE uid = ?", (uid,)
-                    ) as cursor:
-                        key_frame = await cursor.fetchone()
-                        if key_frame:
-                            key_frame = key_frame[0]
-                            if os.path.exists(key_frame) and f"/{DOMAIN}/" in key_frame:
-                                os.remove(key_frame)
-                                _LOGGER.info(f"Deleted image: {key_frame}")
-            except aiosqlite.Error as e:
-                _LOGGER.error(f"Error deleting image: {e}")
-                return False
-            return True
+                    ) as cur:
+                        row = await cur.fetchone()
+                        if not row:
+                            return True
+                        event_key_frame = row[0]
 
-        success_image = await _delete_image(uid)
-        success_event = await _delete_event_from_db(uid)
-        return success_image and success_event
+                    associated_images = set()
+                    if event_key_frame:
+                        associated_images.add(event_key_frame)
+
+                    has_event_images = False
+                    async with db.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name='event_images'"
+                    ) as cur:
+                        has_event_images = await cur.fetchone() is not None
+
+                    if has_event_images:
+                        async with db.execute(
+                            "SELECT image_path FROM event_images WHERE event_uid = ?", (uid,)
+                        ) as cur:
+                            for img_row in await cur.fetchall():
+                                if img_row[0]:
+                                    associated_images.add(img_row[0])
+
+                    # Fetch other events' keyframes and event_images for canonical ownership check
+                    async with db.execute(
+                        "SELECT key_frame FROM events WHERE uid != ? AND key_frame IS NOT NULL AND key_frame != ''",
+                        (uid,),
+                    ) as cur:
+                        other_keyframes = {
+                            self._normalize_image_path(r[0])
+                            for r in await cur.fetchall()
+                        }
+
+                    other_saved_frames = set()
+                    if has_event_images:
+                        async with db.execute(
+                            "SELECT image_path FROM event_images WHERE event_uid != ? AND image_path IS NOT NULL AND image_path != ''",
+                            (uid,),
+                        ) as cur:
+                            other_saved_frames = {
+                                self._normalize_image_path(r[0])
+                                for r in await cur.fetchall()
+                            }
+
+                    other_all_frames = other_keyframes | other_saved_frames
+
+                    for img in associated_images:
+                        canon_img = self._normalize_image_path(img)
+                        if canon_img and canon_img not in other_all_frames:
+                            unshared_images_to_delete.append(img)
+
+                    # Delete associations and event in the same transaction
+                    if has_event_images:
+                        await db.execute(
+                            "DELETE FROM event_images WHERE event_uid = ?", (uid,)
+                        )
+                    await db.execute("DELETE FROM events WHERE uid = ?", (uid,))
+                    await db.commit()
+
+                # Filesystem deletion only happens after successful DB commit (still under lock)
+                deleted_canonical = set()
+                for img_path in unshared_images_to_delete:
+                    canon = self._normalize_image_path(img_path)
+                    if canon in deleted_canonical:
+                        continue
+                    if self._is_safe_snapshot_path(img_path):
+                        try:
+                            exists = await self.hass.async_add_executor_job(
+                                os.path.exists, img_path
+                            )
+                            if exists:
+                                await self.hass.async_add_executor_job(
+                                    os.remove, img_path
+                                )
+                                deleted_canonical.add(canon)
+                                _LOGGER.info(f"Deleted unshared image: {img_path}")
+                        except OSError as e:
+                            _LOGGER.warning(f"Failed to delete image {img_path}: {e}")
+
+            await self.load_events()
+            return True
+        except Exception as e:
+            _LOGGER.error(f"Error deleting event {uid}: {e}")
+            return False
 
     async def _cleanup(self):
         """Deletes images not associated with any events.
@@ -971,6 +1323,7 @@ class Timeline:
           - Images linked to events.
           - Pending key_frames (event insert in progress).
           - Very new files (grace period).
+        Fail-closed: If DB query fails, aborts immediately without removing any files.
         """
         if getattr(self, "_migrating", False):
             # Skip cleanup during migration
@@ -978,11 +1331,43 @@ class Timeline:
 
         GRACE_SECONDS = 30
 
-        async with self._cleanup_lock:
-            linked_frames = {
-                (os.path.basename(n) or "").lower()
-                for n in await self.get_linked_images()
-            }
+        # Run purge outside lock
+        try:
+            await self._purge_expired_events()
+        except Exception as e:
+            _LOGGER.warning(f"[CLEANUP] Pre-cleanup purge failed: {e}")
+
+        async with self._get_mutation_lock():
+            # Query linked frames directly from DB under lock (fail-closed)
+            try:
+                linked_frames = set()
+                async with aiosqlite.connect(self._db_path) as db:
+                    async with db.execute(
+                        "SELECT key_frame FROM events WHERE key_frame IS NOT NULL AND key_frame != ''"
+                    ) as cur:
+                        for row in await cur.fetchall():
+                            base = os.path.basename(row[0])
+                            if base:
+                                linked_frames.add(base.lower())
+
+                    async with db.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name='event_images'"
+                    ) as cur:
+                        has_table = await cur.fetchone() is not None
+
+                    if has_table:
+                        async with db.execute(
+                            "SELECT image_path FROM event_images WHERE image_path IS NOT NULL AND image_path != ''"
+                        ) as cur:
+                            for row in await cur.fetchall():
+                                base = os.path.basename(row[0])
+                                if base:
+                                    linked_frames.add(base.lower())
+            except Exception as e:
+                _LOGGER.error(
+                    f"[CLEANUP] Database read failed while querying linked frames: {e}. Aborting cleanup to fail closed."
+                )
+                return
 
             # List files in snapshots dir (in executor, non-blocking)
             try:

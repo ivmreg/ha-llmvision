@@ -1,3 +1,4 @@
+from typing import Any
 from datetime import datetime
 from .timeline import Timeline
 from .providers import Request
@@ -85,44 +86,11 @@ from .const import (
     CONF_THINK,
     CONF_REASONING_EFFORT,
 )
+from .stream_buffer import StreamBufferManager
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 _LOGGER = logging.getLogger(__name__)
-
-
-async def _async_start_stream_keepers(hass, entry):
-    """Start or ensure stream keepers are running for configured cameras."""
-    buffered_cameras = entry.data.get(CONF_STREAM_BUFFER_CAMERAS) or []
-    if DOMAIN not in hass.data:
-        hass.data[DOMAIN] = {}
-    if "active_streams" not in hass.data[DOMAIN]:
-        hass.data[DOMAIN]["active_streams"] = {}
-
-    for camera_entity in buffered_cameras:
-        if camera_entity not in hass.data[DOMAIN]["active_streams"]:
-            try:
-                camera = None
-                try:
-                    from homeassistant.components.camera import get_camera_from_entity_id
-                    camera = get_camera_from_entity_id(hass, camera_entity)
-                except Exception:
-                    pass
-                if camera:
-                    stream = await camera.async_create_stream()
-                    if stream:
-                        if hasattr(stream, "dynamic_stream_settings"):
-                            stream.dynamic_stream_settings.preload_stream = True
-                        stream.add_provider("hls")
-                        await stream.start()
-                        hass.data[DOMAIN]["active_streams"][camera_entity] = stream
-                        _LOGGER.info(
-                            f"LLM Vision: Started stream buffer keeper for {camera_entity}"
-                        )
-            except Exception as e:
-                _LOGGER.warning(
-                    f"LLM Vision: Could not start stream buffer keeper for {camera_entity}: {e}"
-                )
 
 
 async def async_setup_entry(hass, entry):
@@ -180,21 +148,26 @@ async def async_setup_entry(hass, entry):
     # Store the filtered config under the entry_uid (subdict per entry)
     hass.data[DOMAIN][entry_uid] = filtered_provider_config
 
-    # If this is the Settings entry, set up the calendar, run cleanup, and start stream keepers
+    # If this is the Settings entry, set up the calendar, run cleanup, and start stream buffer manager
     if filtered_provider_config.get(CONF_PROVIDER) == "Settings":
         await hass.config_entries.async_forward_entry_setups(entry, ["calendar"])
         timeline = Timeline(hass, entry)
         await timeline._cleanup()
 
-        # Start stream keepers for configured buffered cameras
-        await _async_start_stream_keepers(hass, entry)
-
-        async def _on_ha_started(event):
-            await _async_start_stream_keepers(hass, entry)
-
-        entry.async_on_unload(
-            hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _on_ha_started)
-        )
+        # Start stream buffer manager for configured buffered cameras
+        manager = StreamBufferManager(hass, entry)
+        hass.data[DOMAIN].setdefault("stream_buffer_managers", {})[entry.entry_id] = manager
+        try:
+            await manager.async_start()
+        except BaseException as err:
+            _LOGGER.error(
+                "LLM Vision: Failed to start stream buffer manager for %s: %s",
+                entry.title,
+                err,
+            )
+            await manager.async_stop()
+            hass.data[DOMAIN].get("stream_buffer_managers", {}).pop(entry.entry_id, None)
+            raise
 
     # Sanitize provider config (remove api_key and value)
     sanitized_provider_config = {
@@ -228,19 +201,6 @@ async def async_remove_entry(hass, entry):
 
 async def async_unload_entry(hass, entry) -> bool:
     _LOGGER.debug(f"Unloading {entry.title} from hass.data")
-    if entry.data.get(CONF_PROVIDER) == "Settings" and "active_streams" in hass.data.get(
-        DOMAIN, {}
-    ):
-        for camera_entity, stream in list(hass.data[DOMAIN]["active_streams"].items()):
-            try:
-                _LOGGER.debug(f"LLM Vision: Stopping stream keeper for {camera_entity}")
-                if hasattr(stream, "dynamic_stream_settings"):
-                    stream.dynamic_stream_settings.preload_stream = False
-                if hasattr(stream, "remove_provider"):
-                    stream.remove_provider("hls")
-            except Exception as e:
-                _LOGGER.debug(f"Error stopping stream keeper for {camera_entity}: {e}")
-        hass.data[DOMAIN]["active_streams"].clear()
 
     # check if the entry is the calendar entry (has entry rentention_time)
     if entry.data.get(CONF_RETENTION_TIME) is not None:
@@ -250,7 +210,16 @@ async def async_unload_entry(hass, entry) -> bool:
         )
     else:
         unload_ok = True
-    return unload_ok
+
+    if not unload_ok:
+        return False
+
+    if entry.data.get(CONF_PROVIDER) == "Settings":
+        managers = hass.data.get(DOMAIN, {}).get("stream_buffer_managers", {})
+        if manager := managers.pop(entry.entry_id, None):
+            await manager.async_stop()
+
+    return True
 
 
 async def async_migrate_entry(hass, config_entry: ConfigEntry) -> bool:
@@ -536,7 +505,7 @@ class ServiceCallData:
         )
         self.interval: int = int(data_call.data.get(INTERVAL, 2))
         self.duration: int = int(data_call.data.get(DURATION, 10))
-        self.lookback: int = int(data_call.data.get(LOOKBACK, 0))
+        self.lookback: int = self._parse_lookback(data_call.data.get(LOOKBACK, 0))
         self.max_frames: int = int(data_call.data.get(MAX_FRAMES, 3))
         self.target_width: int = data_call.data.get(TARGET_WIDTH, 3840)
         self.temperature: float = float()
@@ -609,6 +578,30 @@ class ServiceCallData:
     def get_service_call_data(self):
         return self
 
+    @staticmethod
+    def _parse_lookback(val: Any) -> int:
+        if val is None:
+            return 0
+        if isinstance(val, bool):
+            raise ServiceValidationError(
+                f"Invalid lookback value '{val}': boolean values are not permitted."
+            )
+        if isinstance(val, float) and not val.is_integer():
+            raise ServiceValidationError(
+                f"Invalid lookback value '{val}': lookback must be an integer between 0 and 60 seconds."
+            )
+        try:
+            int_val = int(val)
+        except (ValueError, TypeError, OverflowError):
+            raise ServiceValidationError(
+                f"Invalid lookback value '{val}': must be a finite integer between 0 and 60 seconds."
+            )
+        if int_val < 0 or int_val > 60:
+            raise ServiceValidationError(
+                f"Requested lookback ({int_val}s) must be between 0 and 60 seconds."
+            )
+        return int_val
+
     def model_is_glimpse(self) -> bool:
         """Check if model is Glimpse-v1 like based on model name"""
         return bool(self.model and "glimpse-v1" in self.model.lower())
@@ -620,6 +613,7 @@ async def _create_event(
     start: datetime,
     response: dict,
     key_frame: str,
+    saved_frames: list[str] | None = None,
 ) -> None:
     if call.get("store_in_timeline"):
         # Find timeline config
@@ -670,6 +664,7 @@ async def _create_event(
             key_frame=key_frame,
             camera_name=camera_name,
             label="",
+            saved_frames=saved_frames,
         )
         async_dispatcher_send(hass, SIGNAL_TIMELINE_UPDATED)
 
@@ -780,46 +775,32 @@ def setup(hass, config):
             start=start,
             response=response,
             key_frame=processor.key_frame,
+            saved_frames=processor.saved_frames,
         )
         return response
 
-    def _validate_lookback(call):
-        """Validate that requested lookback is supported by configured stream buffer settings."""
-        if not call.lookback or call.lookback <= 0:
-            return
-
-        # Find Settings entry data
-        settings_data = {}
-        for entry_id, entry_cfg in hass.data.get(DOMAIN, {}).items():
-            if isinstance(entry_cfg, dict) and entry_cfg.get(CONF_PROVIDER) == "Settings":
-                settings_data = entry_cfg
-                break
-
-        buffered_cameras = settings_data.get(CONF_STREAM_BUFFER_CAMERAS) or []
-        max_buffer_seconds = settings_data.get(
-            CONF_STREAM_BUFFER_SECONDS, DEFAULT_STREAM_BUFFER_SECONDS
-        )
-
-        image_entities = call.image_entities or []
-        if isinstance(image_entities, str):
-            image_entities = [image_entities]
-
-        for camera in image_entities:
-            if camera not in buffered_cameras:
-                raise ServiceValidationError(
-                    f"Lookback ({call.lookback}s) was requested for '{camera}', but this camera is not configured for stream buffering in LLM Vision Settings. Please add it under LLM Vision Settings -> Stream Buffer Cameras."
-                )
-
-        if call.lookback > max_buffer_seconds:
-            raise ServiceValidationError(
-                f"Requested lookback ({call.lookback}s) exceeds the configured stream buffer limit ({max_buffer_seconds}s) in LLM Vision Settings. Please increase the buffer limit in Settings or reduce lookback."
-            )
+    def _get_stream_buffer_manager():
+        managers = hass.data.get(DOMAIN, {}).get("stream_buffer_managers", {})
+        if managers:
+            return next(iter(managers.values()))
+        return None
 
     async def video_analyzer(data_call):
         """Handle the service call to analyze a video (future implementation)"""
         start = dt_util.now()
+        # Explicitly reject lookback parameter for video_analyzer
+        raw_lookback = data_call.data.get(LOOKBACK)
+        if raw_lookback is not None:
+            try:
+                lookback_val = float(raw_lookback)
+            except (ValueError, TypeError):
+                lookback_val = 1
+            if lookback_val != 0:
+                raise ServiceValidationError(
+                    "The 'lookback' parameter is not supported by video_analyzer. Pre-roll stream buffering is only available for live camera feeds in stream_analyzer."
+                )
+
         call = ServiceCallData(data_call).get_service_call_data()
-        _validate_lookback(call)
         call.message = "The attached images are frames from a video. " + call.message
 
         request = Request(
@@ -836,7 +817,6 @@ def setup(hass, config):
             target_width=call.target_width,
             include_filename=call.include_filename,
             expose_images=call.expose_images,
-            lookback=call.lookback,
         )
         call.memory = Memory(hass)
         await call.memory._update_memory()
@@ -854,6 +834,7 @@ def setup(hass, config):
             start=start,
             response=response,
             key_frame=processor.key_frame,
+            saved_frames=processor.saved_frames,
         )
         return response
 
@@ -861,7 +842,15 @@ def setup(hass, config):
         """Handle the service call to analyze a stream"""
         start = dt_util.now()
         call = ServiceCallData(data_call).get_service_call_data()
-        _validate_lookback(call)
+
+        if call.lookback > 0:
+            manager = _get_stream_buffer_manager()
+            if manager is None:
+                raise ServiceValidationError(
+                    "Stream buffer manager is not active. Pre-roll lookback requires an active stream buffer in LLM Vision Settings."
+                )
+            manager.validate_lookback(call.image_entities, call.lookback)
+
         call.message = (
             "The attached images are frames from a live camera feed. " + call.message
         )
@@ -899,6 +888,7 @@ def setup(hass, config):
             start=start,
             response=response,
             key_frame=processor.key_frame,
+            saved_frames=processor.saved_frames,
         )
         return response
 
@@ -980,6 +970,7 @@ def setup(hass, config):
             start=start,
             response=response,
             key_frame=processor.key_frame,
+            saved_frames=processor.saved_frames,
         )
 
         _LOGGER.debug(f"Response: {response}")

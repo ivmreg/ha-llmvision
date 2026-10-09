@@ -231,17 +231,6 @@ video_analyzer:
       default: 3000
       selector:
         number:
-    lookback:
-      name: Lookback
-      required: false
-      description: 'Number of seconds to look back prior to the service call. Requires camera to be configured in LLM Vision Settings -> Stream Buffer Cameras up to the configured buffer limit.'
-      example: 5
-      default: 0
-      selector:
-        number:
-          min: 0
-          max: 60
-          unit_of_measurement: "seconds"
     generate_title:
       name: Generate Title
       required: false
@@ -395,7 +384,7 @@ stream_analyzer:
     lookback:
       name: Lookback
       required: false
-      description: 'Number of seconds to look back prior to the service call. Requires camera to be configured in LLM Vision Settings -> Stream Buffer Cameras up to the configured buffer limit.'
+      description: 'Number of seconds to look back prior to the service call (0-60s). Best-effort pre-roll buffer; requires camera to be configured in Stream Buffer Cameras and sufficiently warmed up.'
       example: 5
       default: 0
       selector:
