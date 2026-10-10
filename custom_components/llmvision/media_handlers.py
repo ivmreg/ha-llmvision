@@ -29,7 +29,6 @@ from .const import DOMAIN, MAX_KEYFRAME_CANDIDATES
 _LOGGER = logging.getLogger(__name__)
 
 
-
 def _sanitize_filename(name: str) -> str:
     """Sanitize name for safe filesystem path usage, preventing directory traversal and separator issues."""
     if not name:
@@ -294,6 +293,7 @@ class MediaProcessor:
         target_width,
         include_filename,
         expose_images,
+        lookback=0,
     ):
         """Wrapper for client.add_frame with integrated recorder
 
@@ -301,7 +301,22 @@ class MediaProcessor:
             image_entities (list[string]): List of camera entities to record
             duration (float): Duration in seconds to record
             target_width (int): Target width for the images in pixels
+            lookback (int): Pre-event lookback duration in seconds
         """
+
+        if isinstance(image_entities, str):
+            image_entities = [image_entities]
+
+        if lookback and lookback > 0:
+            return await self._record_with_lookback(
+                image_entities=image_entities,
+                duration=duration,
+                lookback=lookback,
+                max_frames=max_frames,
+                target_width=target_width,
+                include_filename=include_filename,
+                expose_images=expose_images,
+            )
 
         if duration is None or duration < 3:
             interval = 1
@@ -1001,6 +1016,274 @@ class MediaProcessor:
 
         return self.client
 
+    async def _safe_cleanup_recorder_provider(self, image_entity, temp_filename):
+        """Safely release only matching owned RecorderOutput provider from stream.
+
+        Matches current native outputs()['recorder'].video_path EXACTLY to temp_filename.
+        Leaves HLS and borrowed providers untouched, never calls stream.stop().
+        """
+        try:
+            stream = None
+            if DOMAIN in self.hass.data and "active_streams" in self.hass.data[DOMAIN]:
+                stream = self.hass.data[DOMAIN]["active_streams"].get(image_entity)
+            if stream is None and hasattr(self.hass, "data") and "camera" in self.hass.data:
+                camera_comp = self.hass.data.get("camera")
+                if hasattr(camera_comp, "get_entity"):
+                    cam_ent = camera_comp.get_entity(image_entity)
+                    if cam_ent and hasattr(cam_ent, "stream"):
+                        stream = cam_ent.stream
+
+            if stream is not None and hasattr(stream, "remove_provider"):
+                outputs = stream.outputs() if callable(getattr(stream, "outputs", None)) else getattr(stream, "outputs", {})
+                recorder = None
+                if isinstance(outputs, dict):
+                    recorder = outputs.get("recorder")
+                elif isinstance(outputs, (list, tuple)):
+                    for p in outputs:
+                        if getattr(p, "name", None) == "recorder" or getattr(p, "video_path", None) == temp_filename:
+                            recorder = p
+                            break
+
+                if recorder is not None and getattr(recorder, "video_path", None) == temp_filename:
+                    _LOGGER.debug(f"Safely removing matching owned recorder provider for {image_entity}")
+                    res = stream.remove_provider(recorder)
+                    if asyncio.iscoroutine(res):
+                        await res
+        except Exception as e:
+            _LOGGER.debug(f"Stream recorder provider cleanup skipped for {image_entity}: {e}")
+
+    async def _record_with_lookback(
+        self,
+        image_entities,
+        duration,
+        lookback,
+        max_frames,
+        target_width,
+        include_filename,
+        expose_images,
+    ):
+        """Record video clip using Home Assistant camera.record with lookback and extract frames.
+
+        Core camera.record semantics and safe provider release disclosure:
+        Home Assistant Core's camera.record service creates a RecorderOutput provider on the stream.
+        When cancelling or on sibling error, our owned RecorderOutput can be released safely via
+        await stream.remove_provider(provider) ONLY if provider.video_path EXACTLY matches our unique
+        temp_filename, leaving HLS and borrowed providers untouched.
+        Cancelling and joining the Python camera.record service task gives an owned task a bounded 2s
+        opportunity to finish, but cannot guarantee halting already-running native executor/thread jobs
+        inside Core or underlying libraries. If an executor job outlives cancellation, late filesystem
+        writes may occur before the OS file handle is closed.
+        Temporary files (including Core's .tmp files) are cleaned up on a best-effort basis without
+        calling stream.stop() or disrupting active HLS viewers.
+        If native stream provider APIs are unavailable, failure is raised explicitly.
+        """
+        if isinstance(image_entities, str):
+            image_entities = [image_entities]
+
+        snapshots_dir = self.snapshots_path.rstrip("/\\")
+        await self.hass.loop.run_in_executor(
+            None, partial(os.makedirs, snapshots_dir, exist_ok=True)
+        )
+        base_url = get_url(self.hass)
+
+        temp_files_to_cleanup = []
+
+        async def record_single_camera_clip(image_entity):
+            entity_state = self.hass.states.get(image_entity)
+            if entity_state is None:
+                _LOGGER.error(f"Camera {image_entity} does not exist")
+                raise ServiceValidationError(f"Camera {image_entity} does not exist")
+
+            friendly_name = (
+                entity_state.attributes.get("friendly_name")
+                or image_entity.replace("camera.", "")
+            )
+            uid = str(uuid.uuid4())[:8]
+            temp_filename = f"{snapshots_dir}/temp_lookback_{uid}.mp4"
+            temp_files_to_cleanup.append(temp_filename)
+
+            _LOGGER.info(
+                f"Recording camera {image_entity} with lookback={lookback}s, duration={duration}s to {temp_filename}"
+            )
+            service_task = asyncio.create_task(
+                self.hass.services.async_call(
+                    "camera",
+                    "record",
+                    {
+                        "entity_id": image_entity,
+                        "filename": temp_filename,
+                        "duration": duration,
+                        "lookback": lookback,
+                    },
+                    blocking=True,
+                )
+            )
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(service_task),
+                    timeout=duration + lookback + 20,
+                )
+            except asyncio.CancelledError:
+                # Orchestration worker was cancelled (e.g. caller cancelled or sibling failed).
+                # Shield owned service task and await natural completion with bounded deadline
+                # so native call finishes/closes files before cleanup.
+                try:
+                    await asyncio.wait_for(asyncio.shield(service_task), timeout=2.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                    if not service_task.done():
+                        service_task.cancel()
+                        try:
+                            await service_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                    await self._safe_cleanup_recorder_provider(image_entity, temp_filename)
+                raise
+            except asyncio.TimeoutError:
+                if not service_task.done():
+                    service_task.cancel()
+                    try:
+                        await service_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                await self._safe_cleanup_recorder_provider(image_entity, temp_filename)
+                _LOGGER.error(
+                    f"Recording timed out for camera {image_entity} after {duration + lookback + 20}s. The stream source may be unreachable."
+                )
+                raise ServiceValidationError(
+                    f"Recording timed out for {image_entity}. Please check that the camera RTSP stream is online and reachable."
+                )
+            except Exception as e:
+                if not service_task.done():
+                    service_task.cancel()
+                    try:
+                        await service_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                await self._safe_cleanup_recorder_provider(image_entity, temp_filename)
+                _LOGGER.error(
+                    f"Error recording camera {image_entity} with lookback: {e}"
+                )
+                if isinstance(e, ServiceValidationError):
+                    raise
+                raise ServiceValidationError(
+                    f"Error recording camera {image_entity} with lookback: {e}"
+                )
+
+            file_exists = await self.hass.loop.run_in_executor(
+                None, os.path.exists, temp_filename
+            )
+            file_size = (
+                await self.hass.loop.run_in_executor(
+                    None, os.path.getsize, temp_filename
+                )
+                if file_exists
+                else 0
+            )
+            _LOGGER.info(
+                f"Camera {image_entity} recorded: exists={file_exists}, size={file_size} bytes"
+            )
+            if not file_exists or file_size == 0:
+                _LOGGER.error(
+                    f"Failed to record stream for {image_entity} with lookback={lookback}s. The file is empty or does not exist."
+                )
+                raise ServiceValidationError(
+                    f"Failed to record stream for {image_entity}. The camera stream may not be active or does not support recording."
+                )
+
+            return {
+                "entity": image_entity,
+                "temp_filename": temp_filename,
+                "friendly_name": friendly_name,
+            }
+
+        tasks = []
+        try:
+            tasks = [
+                asyncio.create_task(record_single_camera_clip(entity))
+                for entity in image_entities
+            ]
+
+            if tasks:
+                done, pending = await asyncio.wait(
+                    tasks, return_when=asyncio.FIRST_EXCEPTION
+                )
+
+                exc = None
+                for t in done:
+                    if t.exception() is not None:
+                        exc = t.exception()
+                        break
+
+                if exc is not None or pending:
+                    if exc is not None:
+                        # Cancel pending sibling tasks immediately on first error
+                        for t in pending:
+                            t.cancel()
+                        # Join cancelled sibling tasks
+                        if pending:
+                            await asyncio.gather(*pending, return_exceptions=True)
+                        if isinstance(exc, ServiceValidationError):
+                            raise exc
+                        raise ServiceValidationError(
+                            f"Error recording camera stream with lookback: {exc}"
+                        )
+                    else:
+                        await asyncio.gather(*pending)
+
+            # Retrieve recorded clip metadata in deterministic input order
+            recorded_clips = [t.result() for t in tasks]
+
+            # Process clips sequentially in input order
+            for clip in recorded_clips:
+                temp_filename = clip["temp_filename"]
+                friendly_name = clip["friendly_name"]
+                override_name = friendly_name if include_filename else ""
+                try:
+                    await self.add_video(
+                        video_path=temp_filename,
+                        base_url=base_url,
+                        max_frames=max_frames,
+                        target_width=target_width,
+                        include_filename=include_filename,
+                        expose_images=expose_images,
+                        override_filename=override_name,
+                    )
+                except Exception as e:
+                    if isinstance(e, ServiceValidationError):
+                        raise
+                    raise ServiceValidationError(
+                        f"Error processing clip for {clip['entity']}: {e}"
+                    )
+
+            if len(recorded_clips) == 0:
+                raise ServiceValidationError(
+                    "No camera recordings could be captured with lookback. Ensure cameras have stream support enabled."
+                )
+
+            return self.client
+
+        except BaseException:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
+        finally:
+            def _cleanup():
+                for fpath in temp_files_to_cleanup:
+                    for target in (fpath, f"{fpath}.tmp"):
+                        if os.path.exists(target):
+                            try:
+                                os.remove(target)
+                            except Exception as e:
+                                _LOGGER.debug(
+                                    f"Failed to remove temp file {target}: {e}"
+                                )
+
+            await self.hass.loop.run_in_executor(None, _cleanup)
+
     async def add_streams(
         self,
         image_entities,
@@ -1009,6 +1292,7 @@ class MediaProcessor:
         target_width,
         include_filename,
         expose_images,
+        lookback=0,
     ):
         if image_entities:
             await self.record(
@@ -1018,6 +1302,7 @@ class MediaProcessor:
                 target_width=target_width,
                 include_filename=include_filename,
                 expose_images=expose_images,
+                lookback=lookback,
             )
         return self.client
 

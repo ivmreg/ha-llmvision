@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 from dataclasses import dataclass
+import importlib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -716,3 +717,118 @@ class TestSetupServices:
         hass.http.register_view.assert_any_call(init_module.TimelineEventsView)
         hass.http.register_view.assert_any_call(init_module.TimelineEventView)
         hass.http.register_view.assert_any_call(init_module.TimelineEventCreateView)
+
+    @pytest.mark.anyio
+    async def test_lookback_validation_unbuffered_camera_raises(self):
+        from custom_components.llmvision.stream_buffer import StreamBufferManager
+
+        hass = _make_hass()
+        assert setup(hass, {}) is True
+        handlers = self._registered_handlers(hass)
+
+        entry = Mock()
+        entry.entry_id = "settings_entry"
+        entry.data = {
+            CONF_PROVIDER: "Settings",
+            "stream_buffer_cameras": ["camera.front_door"],
+            "stream_buffer_seconds": 15,
+        }
+        manager = StreamBufferManager(hass, entry)
+        manager.is_active = True
+        hass.data[DOMAIN] = {
+            "stream_buffer_managers": {"settings_entry": manager}
+        }
+
+        # Request lookback on a non-buffered camera
+        data_call = _build_data_call(
+            _base_service_data(image_entity=["camera.backyard"], lookback=5)
+        )
+        with pytest.raises(ServiceValidationError, match="not configured for stream buffering"):
+            await handlers["stream_analyzer"](data_call)
+
+    @pytest.mark.anyio
+    async def test_lookback_validation_exceeding_limit_raises(self):
+        from custom_components.llmvision.stream_buffer import StreamBufferManager
+
+        hass = _make_hass()
+        assert setup(hass, {}) is True
+        handlers = self._registered_handlers(hass)
+
+        entry = Mock()
+        entry.entry_id = "settings_entry"
+        entry.data = {
+            CONF_PROVIDER: "Settings",
+            "stream_buffer_cameras": ["camera.front_door"],
+            "stream_buffer_seconds": 10,
+        }
+        manager = StreamBufferManager(hass, entry)
+        manager.is_active = True
+        hass.data[DOMAIN] = {
+            "stream_buffer_managers": {"settings_entry": manager}
+        }
+
+        # Request lookback of 20s when limit is 10s
+        data_call = _build_data_call(
+            _base_service_data(image_entity=["camera.front_door"], lookback=20)
+        )
+        with pytest.raises(ServiceValidationError, match="exceeds the configured maximum requested lookback"):
+            await handlers["stream_analyzer"](data_call)
+
+    @pytest.mark.anyio
+    async def test_video_analyzer_rejects_lookback(self):
+        hass = _make_hass()
+        assert setup(hass, {}) is True
+        handlers = self._registered_handlers(hass)
+
+        data_call = _build_data_call(
+            _base_service_data(video_file="test.mp4", lookback=5)
+        )
+        with pytest.raises(ServiceValidationError, match="not supported by video_analyzer"):
+            await handlers["video_analyzer"](data_call)
+
+    @pytest.mark.anyio
+    async def test_stream_keeper_setup_and_unload(self, tmp_path):
+        hass = _make_hass()
+        hass.config.path.side_effect = lambda *parts: str(tmp_path.joinpath(*parts))
+        mock_camera = Mock()
+        mock_stream = Mock()
+        mock_stream.dynamic_stream_settings = Mock(preload_stream=False)
+        mock_hls = Mock(idle_timer=Mock(start=Mock()))
+        mock_stream.outputs = Mock(return_value={})
+        mock_stream.add_provider = Mock(return_value=mock_hls)
+        mock_stream.start = AsyncMock()
+        mock_camera.async_create_stream = AsyncMock(return_value=mock_stream)
+
+        entry = Mock()
+        entry.entry_id = "settings_entry"
+        entry.title = "LLM Vision Settings"
+        entry.data = {
+            CONF_PROVIDER: "Settings",
+            CONF_RETENTION_TIME: 7,
+            "stream_buffer_cameras": ["camera.front_door"],
+            "stream_buffer_seconds": 15,
+        }
+
+        with (
+            patch("custom_components.llmvision.Timeline._cleanup", new=AsyncMock()),
+            patch("custom_components.llmvision.timeline.os.makedirs"),
+            patch.object(
+                importlib.import_module("homeassistant.components.camera"),
+                "get_camera_from_entity_id",
+                return_value=mock_camera,
+            ),
+        ):
+            await async_setup_entry(hass, entry)
+
+            assert "settings_entry" in hass.data[DOMAIN]["stream_buffer_managers"]
+            manager = hass.data[DOMAIN]["stream_buffer_managers"]["settings_entry"]
+            assert "camera.front_door" in manager.leases
+            assert mock_stream.dynamic_stream_settings.preload_stream is True
+            mock_stream.add_provider.assert_called_with("hls")
+            mock_stream.start.assert_awaited_once()
+
+            # Unload entry
+            await async_unload_entry(hass, entry)
+            assert mock_stream.dynamic_stream_settings.preload_stream is False
+            mock_hls.idle_timer.start.assert_called_once()
+            assert "settings_entry" not in hass.data[DOMAIN].get("stream_buffer_managers", {})

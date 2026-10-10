@@ -444,6 +444,34 @@
                             "memory_paths": "Provide the path to the image file.",
                             "memory_strings": "Provide a description of the image (e.g.: 'This is Cookie, my dog'). Images and descriptions must be in the same order, and there must be as many descriptions as images."
                         }
+                    },
+                    "stream_buffer_section": {
+                        "name": "Stream Buffer (Pre-roll)",
+                        "description": "Keep pre-event video buffer active for configured cameras so lookback can capture activity leading up to an event. Warning: Pre-buffering multiple camera streams continuously consumes CPU and network bandwidth, which may impact lower-powered hardware.",
+                        "data": {
+                            "stream_buffer_cameras": "Stream buffer cameras",
+                            "stream_buffer_seconds": "Maximum requested lookback"
+                        },
+                        "data_description": {
+                            "stream_buffer_cameras": "Select cameras to keep pre-buffered in memory for lookback support.",
+                            "stream_buffer_seconds": "Maximum lookback duration in seconds that service calls may request. Note: This does not configure Home Assistant stream buffer capacity; retained lookback is best-effort and constrained by Core stream segment durations and warmup state."
+                        }
+                    }
+                }
+            },
+            "reconfigure": {
+                "sections": {
+                    "stream_buffer_section": {
+                        "name": "Stream Buffer (Pre-roll)",
+                        "description": "Keep pre-event video buffer active for configured cameras so lookback can capture activity leading up to an event. Warning: Pre-buffering multiple camera streams continuously consumes CPU and network bandwidth, which may impact lower-powered hardware.",
+                        "data": {
+                            "stream_buffer_cameras": "Stream buffer cameras",
+                            "stream_buffer_seconds": "Maximum requested lookback"
+                        },
+                        "data_description": {
+                            "stream_buffer_cameras": "Select cameras to keep pre-buffered in memory for lookback support.",
+                            "stream_buffer_seconds": "Maximum lookback duration in seconds that service calls may request. Note: This does not configure Home Assistant stream buffer capacity; retained lookback is best-effort and constrained by Core stream segment durations and warmup state."
+                        }
                     }
                 }
             }
@@ -459,6 +487,26 @@
         "abort": {
             "unknown_provider": "Unknown provider",
             "reconfigure_successful": "Saved settings successfully"
+        }
+    },
+    "options": {
+        "step": {
+            "init": {
+                "sections": {
+                    "stream_buffer_section": {
+                        "name": "Stream Buffer (Pre-roll)",
+                        "description": "Keep pre-event video buffer active for configured cameras so lookback can capture activity leading up to an event. Warning: Pre-buffering multiple camera streams continuously consumes CPU and network bandwidth, which may impact lower-powered hardware.",
+                        "data": {
+                            "stream_buffer_cameras": "Stream buffer cameras",
+                            "stream_buffer_seconds": "Maximum requested lookback"
+                        },
+                        "data_description": {
+                            "stream_buffer_cameras": "Select cameras to keep pre-buffered in memory for lookback support.",
+                            "stream_buffer_seconds": "Maximum lookback duration in seconds that service calls may request. Note: This does not configure Home Assistant stream buffer capacity; retained lookback is best-effort and constrained by Core stream segment durations and warmup state."
+                        }
+                    }
+                }
+            }
         }
     }
 }
