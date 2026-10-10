@@ -54,6 +54,7 @@ class MediaProcessor:
         self.snapshots_path = f"/media/{DOMAIN}/snapshots/"
         self.key_frame = ""
         self.saved_frames = []
+        self.timings = {}
 
     async def _encode_image(self, img):
         """Encode image as base64"""
@@ -318,6 +319,8 @@ class MediaProcessor:
                 expose_images=expose_images,
             )
 
+        t_capture_start = time.monotonic()
+
         if duration is None or duration < 3:
             interval = 1
         elif duration < 10:
@@ -545,6 +548,10 @@ class MediaProcessor:
                     )
                 if start_saved_len + key_idx < len(self.saved_frames):
                     self.key_frame = self.saved_frames[start_saved_len + key_idx]
+
+        self.timings["capture_and_frames_s"] = round(
+            time.monotonic() - t_capture_start, 3
+        )
 
     async def add_images(
         self, image_entities, image_paths, target_width, include_filename, expose_images
@@ -1196,6 +1203,7 @@ class MediaProcessor:
                 "friendly_name": friendly_name,
             }
 
+        t_record_start = time.monotonic()
         tasks = []
         try:
             tasks = [
@@ -1232,7 +1240,9 @@ class MediaProcessor:
 
             # Retrieve recorded clip metadata in deterministic input order
             recorded_clips = [t.result() for t in tasks]
+            self.timings["recording_s"] = round(time.monotonic() - t_record_start, 3)
 
+            t_frame_start = time.monotonic()
             # Process clips sequentially in input order
             for clip in recorded_clips:
                 temp_filename = clip["temp_filename"]
@@ -1254,6 +1264,9 @@ class MediaProcessor:
                     raise ServiceValidationError(
                         f"Error processing clip for {clip['entity']}: {e}"
                     )
+            self.timings["frame_processing_s"] = round(
+                time.monotonic() - t_frame_start, 3
+            )
 
             if len(recorded_clips) == 0:
                 raise ServiceValidationError(

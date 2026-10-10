@@ -523,10 +523,13 @@ class TestSetupServices:
         response_obj = {"response_text": "ok"}
         request_obj = Mock()
         request_obj.call = AsyncMock(return_value=response_obj)
+        request_obj.timings = {"vision_request_s": 0.050, "title_request_s": 0.020}
         memory_obj = Mock()
         memory_obj._update_memory = AsyncMock()
         processor = Mock()
         processor.key_frame = "frame.jpg"
+        processor.saved_frames = []
+        processor.timings = {"recording_s": 0.100, "frame_processing_s": 0.030}
         processor.add_images = AsyncMock(return_value=request_obj)
         processor.add_videos = AsyncMock(return_value=request_obj)
         processor.add_streams = AsyncMock(return_value=request_obj)
@@ -554,6 +557,14 @@ class TestSetupServices:
         assert video_result["key_frame"] == "frame.jpg"
         assert stream_result["key_frame"] == "frame.jpg"
         assert create_event_mock.await_count == 3
+        assert "timings" in stream_result
+        assert stream_result["timings"]["recording_s"] == 0.100
+        assert stream_result["timings"]["frame_processing_s"] == 0.030
+        assert stream_result["timings"]["vision_request_s"] == 0.050
+        assert stream_result["timings"]["title_request_s"] == 0.020
+        assert "timeline_save_s" in stream_result["timings"]
+        assert "total_analyzer_s" in stream_result["timings"]
+        assert "overhead_s" in stream_result["timings"]
 
     @pytest.mark.anyio
     async def test_data_analyzer_boolean_and_number_and_text_and_option(self):
