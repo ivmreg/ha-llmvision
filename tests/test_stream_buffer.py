@@ -413,3 +413,22 @@ def test_validate_lookback_simulated_import_error_raises_service_validation_erro
                 match="Home Assistant stream component MAX_SEGMENTS capability is unavailable.",
             ):
                 manager.validate_lookback(["camera.front"], 24)
+
+
+def test_services_yaml_max_tokens_and_lookback_selectors():
+    """Regression test ensuring max_tokens selector is number in all services and lookback is only in stream_analyzer."""
+    import yaml
+
+    with open("custom_components/llmvision/services.yaml", encoding="utf-8") as f:
+        services = yaml.safe_load(f)
+
+    # Video analyzer has valid number selector for max_tokens and NO lookback field
+    video_fields = services["video_analyzer"]["fields"]
+    assert "number" in video_fields["max_tokens"]["selector"]
+    assert "lookback" not in video_fields
+
+    # Stream analyzer has valid selectors
+    stream_fields = services["stream_analyzer"]["fields"]
+    assert "number" in stream_fields["max_tokens"]["selector"]
+    assert "number" in stream_fields["lookback"]["selector"]
+    assert "0-60s" in stream_fields["lookback"]["description"]
