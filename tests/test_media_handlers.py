@@ -1,11 +1,14 @@
 """Unit tests for media_handlers.py module."""
+import asyncio
+import os
+import io
+import base64
 import pytest
 from unittest.mock import Mock, patch, AsyncMock, MagicMock
 from PIL import Image
-import io
-import base64
 from types import SimpleNamespace
 from homeassistant.exceptions import ServiceValidationError
+from custom_components.llmvision.const import DOMAIN
 from custom_components.llmvision.media_handlers import MediaProcessor
 
 
@@ -69,6 +72,7 @@ class TestMediaProcessor:
     def mock_hass(self):
         """Create a mock Home Assistant instance."""
         hass = Mock()
+        hass.data = {}
         hass.loop = Mock()
         hass.loop.run_in_executor = AsyncMock()
         hass.states = Mock()
@@ -85,18 +89,23 @@ class TestMediaProcessor:
         return client
 
     @pytest.fixture
-    def processor(self, mock_hass, mock_client):
+    def processor(self, mock_hass, mock_client, tmp_path):
         """Create a MediaProcessor instance."""
         with patch('custom_components.llmvision.media_handlers.async_get_clientsession'):
-            return MediaProcessor(mock_hass, mock_client)
+            proc = MediaProcessor(mock_hass, mock_client)
+            proc.snapshots_path = str(tmp_path / "snapshots") + "/"
+            return proc
 
-    def test_init(self, processor, mock_hass, mock_client):
+    def test_init(self, mock_hass, mock_client):
         """Test MediaProcessor initialization."""
+        with patch('custom_components.llmvision.media_handlers.async_get_clientsession'):
+            processor = MediaProcessor(mock_hass, mock_client)
         assert processor.hass == mock_hass
         assert processor.client == mock_client
         assert processor.base64_images == []
         assert processor.filenames == []
         assert processor.key_frame == ""
+        assert processor.snapshots_path == "/media/llmvision/snapshots/"
 
     @pytest.mark.asyncio
     async def test_encode_image(self, processor):
@@ -129,7 +138,7 @@ class TestMediaProcessor:
 
     @pytest.mark.asyncio
     async def test_expose_image_uses_frame_path_once(self, processor, tmp_path):
-        """_expose_image should derive image data from a file only for the first keyframe."""
+        """_expose_image should derive image data from a file and track all saved frames."""
         processor.hass.loop.run_in_executor.side_effect = (
             lambda _executor, func, *args: func(*args)
         )
@@ -151,7 +160,10 @@ class TestMediaProcessor:
             )
 
         assert processor.key_frame.endswith("deadbeef-7.jpg")
-        processor._save_clip.assert_awaited_once()
+        assert len(processor.saved_frames) == 2
+        assert processor.saved_frames[0].endswith("deadbeef-7.jpg")
+        assert processor.saved_frames[1].endswith("second-8.jpg")
+        assert processor._save_clip.await_count == 2
 
     @pytest.mark.asyncio
     async def test_select_keyframe_index_picks_lowest_similarity(self, processor):
@@ -743,6 +755,10 @@ class TestMediaProcessor:
         assert result is processor.client
         processor.record.assert_awaited_once()
 
+
+
+
+
     @pytest.mark.asyncio
     async def test_add_visual_data_delegates_to_add_images(self, processor):
         """add_visual_data should proxy to add_images."""
@@ -758,3 +774,217 @@ class TestMediaProcessor:
 
         assert result is processor.client
         processor.add_images.assert_awaited_once()
+
+
+    @pytest.mark.asyncio
+    async def test_add_videos_deterministic_input_order_and_keyframe(
+        self, processor, tmp_path
+    ):
+        """add_videos must execute real add_video sequentially in input order and resolve keyframes per-video locally."""
+        processor.snapshots_path = str(tmp_path / "snapshots") + "/"
+        processor.hass.loop.run_in_executor.side_effect = (
+            lambda _executor, func, *args: func(*args)
+        )
+
+        v1_frames = [_make_jpeg_bytes((10, 10, i * 50)) for i in range(3)]
+        v2_frames = [_make_jpeg_bytes((200, 200, i * 50)) for i in range(2)]
+
+        class FakeStdout:
+            def __init__(self, chunks):
+                self._chunks = list(chunks)
+
+            async def read(self, _size):
+                if self._chunks:
+                    return self._chunks.pop(0)
+                return b""
+
+        class FakeProcess:
+            def __init__(self, frames):
+                self.pid = 101
+                self.stdout = FakeStdout([b"".join(frames), b""])
+                self.stderr = None
+                self.returncode = 0
+
+            async def wait(self):
+                return self.returncode
+
+        async def fake_create_subprocess_exec(*args, **kwargs):
+            cmd_str = " ".join(args)
+            if "clip1.mp4" in cmd_str:
+                return FakeProcess(v1_frames)
+            else:
+                return FakeProcess(v2_frames)
+
+        processor._select_keyframe_index = AsyncMock(side_effect=[1, 0])
+        processor._similarity_score = Mock(return_value=0.5)
+        processor.resize_image = AsyncMock(
+            side_effect=lambda target_width, image_data=None, **kw: base64.b64encode(image_data or b"").decode("utf-8")
+        )
+
+        with patch(
+            "custom_components.llmvision.media_handlers.get_url",
+            return_value="http://ha.local",
+        ), patch(
+            "custom_components.llmvision.media_handlers.asyncio.create_subprocess_exec",
+            fake_create_subprocess_exec,
+        ):
+            await processor.add_videos(
+                video_paths=["/media/clip1.mp4", "/media/clip2.mp4"],
+                event_ids=[],
+                max_frames=3,
+                target_width=128,
+                include_filename=False,
+                expose_images=True,
+            )
+
+        assert len(processor.saved_frames) == 5
+        assert all("clip1-frame_" in f for f in processor.saved_frames[:3])
+        assert all("clip2-frame_" in f for f in processor.saved_frames[3:])
+
+        clip1_keyframe = processor.saved_frames[1]
+        assert "clip1-frame_2" in clip1_keyframe
+
+        clip2_keyframe = processor.saved_frames[3]
+        assert "clip2-frame_1" in clip2_keyframe
+        assert processor.key_frame == clip2_keyframe
+
+    @pytest.mark.asyncio
+    async def test_path_separators_sanitization_and_write_failure_state(
+        self, processor, tmp_path
+    ):
+        """Friendly names must keep readable LLM labels, while filesystem paths sanitize all separators; write failures must not alter bookkeeping."""
+        processor.snapshots_path = str(tmp_path / "snapshots") + "/"
+        encoded_img = base64.b64encode(b"fake-image").decode("utf-8")
+
+        frame_bytes = [_make_jpeg_bytes("blue")]
+
+        class FakeStdout:
+            def __init__(self, chunks):
+                self._chunks = list(chunks)
+
+            async def read(self, _size):
+                if self._chunks:
+                    return self._chunks.pop(0)
+                return b""
+
+        class FakeProcess:
+            def __init__(self):
+                self.pid = 99
+                self.stdout = FakeStdout([b"".join(frame_bytes), b""])
+                self.stderr = None
+                self.returncode = 0
+
+            async def wait(self):
+                return self.returncode
+
+        processor.resize_image = AsyncMock(return_value=encoded_img)
+        processor._select_keyframe_index = AsyncMock(return_value=0)
+        exposed_names = []
+
+        real_expose = processor._expose_image
+
+        async def track_expose(frame_name, image_data, uid, frame_path=None):
+            exposed_names.append(frame_name)
+            return await real_expose(frame_name, image_data, uid, frame_path=frame_path)
+
+        processor._expose_image = track_expose
+
+        with patch(
+            "custom_components.llmvision.media_handlers.asyncio.create_subprocess_exec",
+            AsyncMock(return_value=FakeProcess()),
+        ):
+            await processor.add_video(
+                video_path="/media/test.mp4",
+                base_url="http://ha.local",
+                max_frames=1,
+                target_width=128,
+                include_filename=True,
+                expose_images=True,
+                override_filename="Front/Porch/Cam:1\\2",
+            )
+
+        assert (
+            processor.client.add_frame.call_args.kwargs["filename"]
+            == "Front/Porch/Cam:1\\2 (frame 1)"
+        )
+        assert len(exposed_names) == 1
+        assert "/" not in exposed_names[0]
+        assert "\\" not in exposed_names[0]
+        assert ":" not in exposed_names[0]
+        assert "Front_Porch_Cam_1_2" in exposed_names[0]
+
+        processor.saved_frames.clear()
+        processor.key_frame = ""
+        processor._save_clip = AsyncMock(side_effect=IOError("Disk write failed"))
+
+        with pytest.raises(IOError, match="Disk write failed"):
+            await real_expose("failed_frame", encoded_img, "bad12345")
+
+        assert len(processor.saved_frames) == 0
+        assert processor.key_frame == ""
+
+    @pytest.mark.asyncio
+    async def test_late_motion_under_bounded_candidates(self, processor):
+        """Candidate frame bounding must drain entire clip to EOF (80+ frames), bound heap to cap 30, and select late motion frames."""
+        processor.hass.loop.run_in_executor.side_effect = (
+            lambda _executor, func, *args: func(*args)
+        )
+        total_frames = 85
+        frame_bytes = [
+            _make_jpeg_bytes((i * 3 % 256, (i * 7 + 10) % 256, (i * 11 + 20) % 256))
+            for i in range(total_frames)
+        ]
+
+        class FakeStdout:
+            def __init__(self, chunks):
+                self._chunks = list(chunks)
+
+            async def read(self, _size):
+                if self._chunks:
+                    return self._chunks.pop(0)
+                return b""
+
+        class FakeProcess:
+            def __init__(self):
+                self.pid = 88
+                self.stdout = FakeStdout([b"".join(frame_bytes), b""])
+                self.stderr = None
+                self.returncode = 0
+
+            async def wait(self):
+                return self.returncode
+
+        scores = [0.95] * 60 + [0.05 + (i * 0.005) for i in range(24)]
+        processor._similarity_score = Mock(side_effect=scores)
+
+        added_frames = []
+        processor.client.add_frame = Mock(
+            side_effect=lambda base64_image, filename: added_frames.append((base64_image, filename))
+        )
+        processor.resize_image = AsyncMock(
+            side_effect=lambda target_width, image_data=None, **kw: base64.b64encode(image_data or b"").decode("utf-8")
+        )
+
+        with patch(
+            "custom_components.llmvision.media_handlers.asyncio.create_subprocess_exec",
+            AsyncMock(return_value=FakeProcess()),
+        ):
+            await processor.add_video(
+                video_path="/media/long_clip.mp4",
+                base_url="http://ha.local",
+                max_frames=3,
+                target_width=128,
+                include_filename=False,
+                expose_images=False,
+            )
+
+        assert processor._similarity_score.call_count == 84
+        assert len(added_frames) == 3
+
+        first_encoded = base64.b64encode(frame_bytes[0]).decode("utf-8")
+        assert added_frames[0][0] == first_encoded
+        assert added_frames[0][1] == "Video frame 1"
+
+        late_encoded = [base64.b64encode(b).decode("utf-8") for b in frame_bytes[61:]]
+        assert added_frames[1][0] in late_encoded
+        assert added_frames[2][0] in late_encoded

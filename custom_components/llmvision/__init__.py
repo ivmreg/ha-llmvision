@@ -554,6 +554,7 @@ async def _create_event(
     start: datetime,
     response: dict,
     key_frame: str,
+    saved_frames: list[str] | None = None,
 ) -> None:
     if call.get("store_in_timeline"):
         # Find timeline config
@@ -604,6 +605,7 @@ async def _create_event(
             key_frame=key_frame,
             camera_name=camera_name,
             label="",
+            saved_frames=saved_frames,
         )
         async_dispatcher_send(hass, SIGNAL_TIMELINE_UPDATED)
 
@@ -705,6 +707,8 @@ def setup(hass, config):
         if processor.key_frame:
             _LOGGER.info(f"Key frame: {processor.key_frame}")
             response["key_frame"] = processor.key_frame
+        if processor.saved_frames:
+            response["saved_frames"] = processor.saved_frames
 
         await _create_event(
             hass=hass,
@@ -712,6 +716,7 @@ def setup(hass, config):
             start=start,
             response=response,
             key_frame=processor.key_frame,
+            saved_frames=processor.saved_frames,
         )
         return response
 
@@ -740,9 +745,11 @@ def setup(hass, config):
         await call.memory._update_memory()
 
         response = await request.call(call)
-        # Add processor.key_frame to response if it exists
+        # Add processor.key_frame and processor.saved_frames to response if they exist
         if processor.key_frame:
             response["key_frame"] = processor.key_frame
+        if processor.saved_frames:
+            response["saved_frames"] = processor.saved_frames
 
         await _create_event(
             hass=hass,
@@ -750,6 +757,7 @@ def setup(hass, config):
             start=start,
             response=response,
             key_frame=processor.key_frame,
+            saved_frames=processor.saved_frames,
         )
         return response
 
@@ -781,9 +789,11 @@ def setup(hass, config):
         await call.memory._update_memory()
 
         response = await request.call(call)
-        # Add processor.key_frame to response if it exists
+        # Add processor.key_frame and processor.saved_frames to response if they exist
         if processor.key_frame:
             response["key_frame"] = processor.key_frame
+        if processor.saved_frames:
+            response["saved_frames"] = processor.saved_frames
 
         await _create_event(
             hass=hass,
@@ -791,6 +801,7 @@ def setup(hass, config):
             start=start,
             response=response,
             key_frame=processor.key_frame,
+            saved_frames=processor.saved_frames,
         )
         return response
 
@@ -863,6 +874,8 @@ def setup(hass, config):
         # Add processor.key_frame to response if it exists
         if processor.key_frame:
             response["key_frame"] = processor.key_frame
+        if processor.saved_frames:
+            response["saved_frames"] = processor.saved_frames
 
         await _create_event(
             hass=hass,
@@ -870,6 +883,7 @@ def setup(hass, config):
             start=start,
             response=response,
             key_frame=processor.key_frame,
+            saved_frames=processor.saved_frames,
         )
 
         _LOGGER.debug(f"Response: {response}")

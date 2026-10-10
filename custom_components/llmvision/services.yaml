@@ -240,7 +240,7 @@ video_analyzer:
         boolean:
     expose_images:
       name: Expose Images
-      description: Save the key frame. This will save analyzed frames in /media/llmvision/snapshots so they can be used for notifications. The file path will be included in the response.
+      description: Save analyzed frames to /media/llmvision/snapshots so they can be viewed or used for notifications. File paths are included in the response.
       required: false
       example: false
       default: false
@@ -390,7 +390,7 @@ stream_analyzer:
         boolean:
     expose_images:
       name: Expose Images
-      description: Save the key frame. This will save analyzed frames in /media/llmvision/snapshots so they can be used for notifications. The file path will be included in the response.
+      description: Save analyzed frames to /media/llmvision/snapshots so they can be viewed or used for notifications. File paths are included in the response.
       required: false
       example: false
       default: false
