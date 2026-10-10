@@ -1,6 +1,8 @@
 """Unit tests for timeline.py module."""
 
+import asyncio
 import datetime
+import json
 import os
 import uuid
 from functools import partial
@@ -115,7 +117,9 @@ def build_timeline(tmp_path, monkeypatch):
 
         hass.loop.run_in_executor = real_run_in_executor
         hass.async_add_executor_job = real_async_add_executor_job
-        hass.async_create_task = lambda coro: None
+        # These method-level tests explicitly initialize their database. Close
+        # suppressed startup coroutines; lifecycle tests below run real tasks.
+        hass.async_create_task = lambda coro: coro.close()
 
         entry = Mock()
         entry.entry_id = "test-entry"
@@ -127,6 +131,224 @@ def build_timeline(tmp_path, monkeypatch):
         return timeline
 
     return _build
+
+
+@pytest.fixture
+async def startup_timelines(build_timeline, tmp_path):
+    """Run real lifecycle tasks, sharing HA state and a temporary media directory."""
+    seed = build_timeline(retention=0)
+    media = tmp_path / "snapshots"
+    media.mkdir()
+    seed._media_path = str(media)
+    tasks = []
+
+    def create_task(coro):
+        task = asyncio.create_task(coro)
+        tasks.append(task)
+        return task
+
+    seed.hass.async_create_task = create_task
+
+    def start():
+        timeline = Timeline(seed.hass, seed._config_entry)
+        timeline._media_path = str(media)
+        return timeline
+
+    yield seed, start, media
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+class TestTimelineStartup:
+    """Real SQLite regressions for startup ordering and interrupted migration."""
+
+    async def test_operations_wait_for_single_shared_migration(
+        self, startup_timelines, monkeypatch
+    ):
+        seed, start, media = startup_timelines
+        await seed._initialize_db()
+        image = media / "existing.jpg"
+        image.write_bytes(b"retained")
+        row = _make_row(
+            "Existing", 0, category="person", label="person", key_frame=str(image)
+        )
+        await _insert_rows(seed._db_path, [row])
+        await seed._set_db_version(4)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        migrated = asyncio.Event()
+        initializations = 0
+        original_initialize = Timeline._initialize_db
+        original_migrate = Timeline._migrate
+
+        async def paused_initialize(timeline):
+            nonlocal initializations
+            initializations += 1
+            entered.set()
+            await release.wait()
+            await original_initialize(timeline)
+
+        async def observed_migrate(timeline):
+            migrated.set()
+            return await original_migrate(timeline)
+
+        monkeypatch.setattr(Timeline, "_initialize_db", paused_initialize)
+        monkeypatch.setattr(Timeline, "_migrate", observed_migrate)
+        first, second = start(), start()
+        now = datetime.datetime.now(datetime.timezone.utc)
+        write = asyncio.create_task(
+            second.create_event(
+                now, now + datetime.timedelta(minutes=1),
+                "New", "", "", "", label="person",
+            )
+        )
+        cleanup = asyncio.create_task(second._cleanup())
+        read = asyncio.create_task(second.get_all_events())
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            await asyncio.sleep(0)
+            assert not migrated.is_set()
+            assert not any(task.done() for task in (write, cleanup, read))
+        finally:
+            release.set()
+            await asyncio.wait_for(asyncio.gather(write, cleanup, read), 5)
+        assert initializations == 1
+        assert await first._get_db_version() == DB_VERSION
+        assert await _fetch_titles(seed._db_path) == ["Existing", "New"]
+        assert {event.title for event in await second.get_all_events()} == {
+            "Existing", "New"
+        }
+        async with aiosqlite.connect(seed._db_path) as db:
+            async with db.execute(
+                "SELECT image_path FROM event_images WHERE event_uid = ?", (row[0],)
+            ) as cursor:
+                assert await cursor.fetchall() == [(str(image),)]
+        assert image.exists()
+
+    async def test_repairs_previously_stamped_v5_backfill(self, startup_timelines):
+        seed, start, media = startup_timelines
+        await seed._initialize_db()
+        image = media / "legacy.jpg"
+        image.write_bytes(b"retained")
+        row = _make_row(
+            "Legacy", 0, category="person", label="person", key_frame=str(image)
+        )
+        await _insert_rows(seed._db_path, [row])
+        await seed._set_db_version(DB_VERSION)
+        timeline = start()
+        events = await asyncio.wait_for(timeline.get_all_events(), 5)
+        assert len(events) == 1
+        async with aiosqlite.connect(seed._db_path) as db:
+            async with db.execute("SELECT event_uid, image_path FROM event_images") as cursor:
+                assert await cursor.fetchall() == [(row[0], str(image))]
+        assert image.exists()
+
+    async def test_failed_step_blocks_operations_and_can_retry(
+        self, startup_timelines, monkeypatch
+    ):
+        seed, start, media = startup_timelines
+        await seed._initialize_db()
+        await seed._set_db_version(4)
+        orphan = media / "orphan.jpg"
+        orphan.write_bytes(b"do not clean up after failure")
+        os.utime(orphan, (1, 1))
+        execute = aiosqlite.Connection.execute
+
+        def locked_update(connection, query, *args, **kwargs):
+            if "UPDATE events SET key_frame" in query:
+                raise aiosqlite.OperationalError("database is locked")
+            return execute(connection, query, *args, **kwargs)
+
+        monkeypatch.setattr(aiosqlite.Connection, "execute", locked_update)
+        failed = start()
+        with pytest.raises(RuntimeError, match="migration failed"):
+            await asyncio.wait_for(failed.get_all_events(), 5)
+        assert await failed._get_db_version() == 4
+        assert orphan.exists()
+        assert failed._migrating
+        monkeypatch.setattr(aiosqlite.Connection, "execute", execute)
+        retry = start()
+        assert await asyncio.wait_for(retry.get_all_events(), 5) == []
+        assert await retry._get_db_version() == DB_VERSION
+        assert not orphan.exists()
+
+    @pytest.mark.parametrize("previous_version", [0, DB_VERSION])
+    async def test_legacy_json_import_does_not_wait_on_itself(
+        self, startup_timelines, previous_version
+    ):
+        seed, start, _ = startup_timelines
+        if previous_version:
+            await seed._initialize_db()
+            await seed._set_db_version(previous_version)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        legacy_path = seed.hass.config.path("llmvision", "events.json")
+        with open(legacy_path, "w", encoding="utf-8") as file:
+            json.dump(
+                [{
+                    "summary": "Legacy JSON", "start": now.isoformat(),
+                    "end": (now + datetime.timedelta(minutes=1)).isoformat(),
+                    "location": "", "label": "person",
+                }], file,
+            )
+        timeline = start()
+        events = await asyncio.wait_for(timeline.get_all_events(), 5)
+        assert [event.title for event in events] == ["Legacy JSON"]
+        assert await timeline._get_db_version() == DB_VERSION
+        assert not os.path.exists(legacy_path)
+
+    async def test_failed_schema_validation_does_not_stamp_version(
+        self, startup_timelines, monkeypatch
+    ):
+        seed, start, _ = startup_timelines
+        await seed._initialize_db()
+        await seed._set_db_version(4)
+        monkeypatch.setattr(Timeline, "_has_latest_schema", AsyncMock(return_value=False))
+        timeline = start()
+        with pytest.raises(RuntimeError, match="migration failed"):
+            await asyncio.wait_for(timeline.get_all_events(), 5)
+        assert await timeline._get_db_version() == 4
+
+    async def test_initialization_failure_blocks_reads(
+        self, startup_timelines, monkeypatch
+    ):
+        seed, start, _ = startup_timelines
+        await seed._initialize_db()
+        await seed._set_db_version(4)
+        monkeypatch.setattr(
+            Timeline, "_initialize_db",
+            AsyncMock(side_effect=aiosqlite.OperationalError("database is locked")),
+        )
+        timeline = start()
+        with pytest.raises(aiosqlite.OperationalError, match="database is locked"):
+            await asyncio.wait_for(timeline.get_all_events(), 5)
+        assert await timeline._get_db_version() == 4
+
+    async def test_cancelled_reader_does_not_cancel_shared_startup(
+        self, startup_timelines, monkeypatch
+    ):
+        _, start, _ = startup_timelines
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        initialize = Timeline._initialize_db
+
+        async def paused_initialize(timeline):
+            entered.set()
+            await release.wait()
+            await initialize(timeline)
+
+        monkeypatch.setattr(Timeline, "_initialize_db", paused_initialize)
+        first = start()
+        request = asyncio.create_task(first.get_all_events())
+        await asyncio.wait_for(entered.wait(), 2)
+        request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        second = start()
+        release.set()
+        assert await asyncio.wait_for(second.get_all_events(), 5) == []
+        assert await second._get_db_version() == DB_VERSION
 
 
 @pytest.fixture
@@ -491,9 +713,11 @@ class TestDatabaseSetup:
         assert "idx_start" in indexes
         assert "idx_end" in indexes
 
-    async def test_initialize_sets_db_version(self, build_timeline):
+    async def test_initialize_does_not_skip_migration(self, build_timeline):
         tl = build_timeline()
         await tl._initialize_db()
+        assert await tl._get_db_version() == 0
+        await tl._migrate()
         assert await tl._get_db_version() == DB_VERSION
 
     async def test_version_zero_before_initialization(self, build_timeline):

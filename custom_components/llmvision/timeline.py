@@ -16,6 +16,7 @@ _LOGGER = logging.getLogger(__name__)
 
 DB_VERSION = 5
 DATA_TIMELINE_MUTATION_LOCKS = "llmvision_timeline_mutation_locks"
+DATA_TIMELINE_STARTUP_TASKS = "llmvision_timeline_startup_tasks"
 
 
 async def _get_category_and_label(
@@ -214,6 +215,7 @@ class Timeline:
         """Initialize the calendar"""
         self.hass = hass
         self.events: list[Event] = []
+        self._events_loaded = False
         self.today_summary = ""
         self.retention_time = config_entry.data.get(CONF_RETENTION_TIME)
 
@@ -229,10 +231,31 @@ class Timeline:
         os.makedirs(os.path.dirname(self._db_path), exist_ok=True)
         os.makedirs(self._media_path, exist_ok=True)
 
-        self.hass.async_create_task(self._initialize_db())
-        self.hass.async_create_task(self._migrate())
-        self.hass.async_create_task(self.load_events())
-        self.hass.async_create_task(self._cleanup())
+        self._startup_task = None
+        startup_tasks = self.hass.data.setdefault(DATA_TIMELINE_STARTUP_TASKS, {})
+        canonical_db = os.path.normcase(os.path.abspath(self._db_path))
+        task = startup_tasks.get(canonical_db)
+        if task is None or (
+            task.done() and (task.cancelled() or task.exception() is not None)
+        ):
+            task = self.hass.async_create_task(self._startup())
+            startup_tasks[canonical_db] = task
+        self._startup_task = task
+
+    async def _startup(self) -> None:
+        """Create and migrate this database before any ordinary operation."""
+        await self._initialize_db()
+        if not await self._migrate():
+            raise RuntimeError("LLM Vision timeline database migration failed")
+        await self.load_events()
+
+    async def _ensure_ready(self) -> None:
+        """Wait for shared startup, without making migration await itself."""
+        task = self._startup_task
+        if task is not None and task is not asyncio.current_task():
+            # A cancelled service request must not cancel startup for other users.
+            await asyncio.shield(task)
+            self._migrating = False
 
     def _get_mutation_lock(self) -> asyncio.Lock:
         """Return the shared mutation lock for this hass instance and db_path."""
@@ -351,51 +374,51 @@ class Timeline:
                 await db.commit()
         except aiosqlite.Error as e:
             _LOGGER.error(f"Error initializing database: {e}")
-        # If version is unset (0), but schema already matches latest, set it
-        try:
-            current = await self._get_db_version()
-            if current == 0 and await self._has_latest_schema():
-                await self._set_db_version(DB_VERSION)
-                _LOGGER.debug(
-                    f"Initialized DB user_version to {DB_VERSION} (schema up-to-date)"
-                )
-        except Exception as e:
-            _LOGGER.debug(f"Post-init version set skipped: {e}")
+            raise
+        # Creating tables does not backfill legacy images or import events.json.
+        # Only successful migration may advance user_version.
 
     async def _migrate(self):
-        """Handles migration for events.db (current v4)"""
+        """Migrate events.db, leaving failed migrations retryable."""
+        completed = False
         try:
             current_version = await self._get_db_version()
-            if current_version >= DB_VERSION:
-                return
+            old_db_path = os.path.join(
+                self.hass.config.path("llmvision"), "events.json"
+            )
+            if current_version >= DB_VERSION and (
+                current_version > DB_VERSION or not os.path.exists(old_db_path)
+            ):
+                if current_version == DB_VERSION:
+                    # Earlier initialization could stamp v5 before backfill ran.
+                    await self._backfill_event_images()
+                completed = await self._has_latest_schema()
+                return completed
 
             _LOGGER.info(
                 f"Starting DB migration (user_version={current_version} -> {DB_VERSION})"
             )
             # v1 -> v2: Migrate events from events.json to events.db
-            old_db_path = os.path.join(
-                self.hass.config.path("llmvision"), "events.json"
-            )
             if os.path.exists(old_db_path):
                 _LOGGER.info("Migrating events from events.json to events.db")
                 with open(old_db_path, "r") as file:
                     data = json.load(file)
                     event_counter = 0
                     for event in data:
-                        await self.hass.loop.create_task(
-                            self.create_event(
-                                start=datetime.datetime.fromisoformat(event["start"]),
-                                end=datetime.datetime.fromisoformat(event["end"]),
-                                title=event.get("summary", ""),
-                                description=event.get("description", ""),
-                                key_frame=event["location"].split(",")[0],
-                                camera_name=(
-                                    event["location"].split(",")[1]
-                                    if len(event["location"].split(",")) > 1
-                                    else ""
-                                ),
-                                label=event.get("label", ""),
-                            )
+                        # Stay in the startup task so readiness does not wait on
+                        # the very migration importing these legacy events.
+                        await self.create_event(
+                            start=datetime.datetime.fromisoformat(event["start"]),
+                            end=datetime.datetime.fromisoformat(event["end"]),
+                            title=event.get("summary", ""),
+                            description=event.get("description", ""),
+                            key_frame=event["location"].split(",")[0],
+                            camera_name=(
+                                event["location"].split(",")[1]
+                                if len(event["location"].split(",")) > 1
+                                else ""
+                            ),
+                            label=event.get("label", ""),
                         )
                         event_counter += 1
                     _LOGGER.info(f"Migrated {event_counter} events")
@@ -434,6 +457,7 @@ class Timeline:
                     await db.commit()
             except aiosqlite.Error as e:
                 _LOGGER.error(f"Error migrating events.db to v4: {e}")
+                return False
 
             # v4 -> v4.1: Migrate image paths to /media/llmvision/snapshots from /config/media/llmvision/snapshots
             try:
@@ -467,6 +491,7 @@ class Timeline:
                     await db.commit()
             except aiosqlite.Error as e:
                 _LOGGER.error(f"Error migrating events.db to v4.1: {e}")
+                return False
 
             # v4.1 -> v4.2: Add category column to events.db
             try:
@@ -485,6 +510,7 @@ class Timeline:
                             _LOGGER.info("Timeline DB migration to v4.2 complete")
             except aiosqlite.Error as e:
                 _LOGGER.error(f"Error migrating events.db to v4.2: {e}")
+                return False
 
             # v4.2 -> v4.3: Remove today_summary column from events.db, add label column, populate label column, rename summary->title
             try:
@@ -555,43 +581,55 @@ class Timeline:
                             await db.commit()
             except aiosqlite.Error as e:
                 _LOGGER.error(f"Error migrating events.db to v4.3: {e}")
+                return False
 
             # v4.3 -> v5: Add event_images table and migrate existing key_frames
             try:
-                async with aiosqlite.connect(self._db_path) as db:
-                    await db.execute("""
-                        CREATE TABLE IF NOT EXISTS event_images (
-                            event_uid TEXT,
-                            image_path TEXT,
-                            PRIMARY KEY (event_uid, image_path)
-                        )
-                    """)
-                    await db.execute("""
-                        CREATE INDEX IF NOT EXISTS idx_event_images_uid ON event_images (event_uid)
-                    """)
-                    await db.execute("""
-                        CREATE INDEX IF NOT EXISTS idx_event_images_path ON event_images (image_path)
-                    """)
-                    await db.execute("""
-                        INSERT OR IGNORE INTO event_images (event_uid, image_path)
-                        SELECT uid, key_frame FROM events
-                        WHERE key_frame IS NOT NULL AND key_frame != ''
-                    """)
-                    await db.commit()
-                    _LOGGER.info("Timeline DB migration to v5 complete (event_images created)")
+                await self._backfill_event_images()
             except aiosqlite.Error as e:
                 _LOGGER.error(f"Error migrating events.db to v5: {e}")
-                return
+                return False
 
             # Mark migration complete by setting user_version
+            if not await self._has_latest_schema():
+                return False
             await self._set_db_version(DB_VERSION)
+            completed = await self._get_db_version() == DB_VERSION
+            if not completed:
+                return False
             _LOGGER.info(f"DB migration complete (user_version={DB_VERSION})")
+            return True
         finally:
-            self._migrating = False
-            try:
-                await self._cleanup()
-            except Exception as e:
-                _LOGGER.warning(f"Post-migration cleanup failed: {e}")
+            self._migrating = not completed
+            if completed:
+                try:
+                    await self._cleanup()
+                except Exception as e:
+                    _LOGGER.warning(f"Post-migration cleanup failed: {e}")
+
+    async def _backfill_event_images(self) -> None:
+        """Idempotently repair legacy keyframe associations, including stamped v5 DBs."""
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS event_images (
+                    event_uid TEXT,
+                    image_path TEXT,
+                    PRIMARY KEY (event_uid, image_path)
+                )
+            """)
+            await db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_event_images_uid ON event_images (event_uid)
+            """)
+            await db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_event_images_path ON event_images (image_path)
+            """)
+            await db.execute("""
+                INSERT OR IGNORE INTO event_images (event_uid, image_path)
+                SELECT uid, key_frame FROM events
+                WHERE key_frame IS NOT NULL AND key_frame != ''
+            """)
+            await db.commit()
+            _LOGGER.info("Timeline DB migration to v5 complete (event_images created)")
 
     def _ensure_datetime(self, dt):
         """Ensures the input is a datetime.datetime object"""
@@ -641,6 +679,7 @@ class Timeline:
 
     async def _purge_expired_events(self) -> None:
         """Remove events older than now - retention_time days and unshared media assets."""
+        await self._ensure_ready()
         if getattr(self, "_migrating", False):
             return
 
@@ -791,6 +830,7 @@ class Timeline:
 
     async def load_events(self):
         """Loads events from the database into memory"""
+        await self._ensure_ready()
         await self._purge_expired_events()
         self.events = []
         try:
@@ -849,11 +889,15 @@ class Timeline:
                             saved_frames=saved_frames,
                         )
                         self.events.append(event)
+            self._events_loaded = True
         except aiosqlite.Error as e:
             _LOGGER.error(f"Error loading events from database: {e}")
 
     async def get_all_events(self) -> list[Event]:
         """Returns calendar events"""
+        await self._ensure_ready()
+        if not self._events_loaded:
+            await self.load_events()
         return self.events
 
     async def get_event(self, uid: str) -> dict | None:
@@ -1005,6 +1049,7 @@ class Timeline:
         saved_frames: list[str] | None = None,
     ) -> None:
         """Adds a new event to calendar"""
+        await self._ensure_ready()
         category = ""
 
         # Ensure dtstart and dtend are datetime objects
@@ -1141,6 +1186,7 @@ class Timeline:
         saved_frames: list[str] | None = None,
     ) -> None:
         """Updates an existing event in the calendar."""
+        await self._ensure_ready()
         # Ensure dtstart and dtend are datetime objects
         if isinstance(start, str):
             start = datetime.datetime.fromisoformat(start)
@@ -1223,6 +1269,7 @@ class Timeline:
         uid: str,
     ) -> bool:
         """Deletes an event from the calendar and removes unshared assets safely."""
+        await self._ensure_ready()
         _LOGGER.info(f"Deleting event with UID: {uid}")
         try:
             unshared_images_to_delete: list[str] = []
@@ -1325,6 +1372,7 @@ class Timeline:
           - Very new files (grace period).
         Fail-closed: If DB query fails, aborts immediately without removing any files.
         """
+        await self._ensure_ready()
         if getattr(self, "_migrating", False):
             # Skip cleanup during migration
             return
