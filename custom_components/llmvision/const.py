@@ -45,9 +45,7 @@ CONF_MEMORY_IMAGES_ENCODED = "memory_images_encoded"
 CONF_MEMORY_STRINGS = "memory_strings"
 CONF_SYSTEM_PROMPT = "system_prompt"
 CONF_TITLE_PROMPT = "title_prompt"
-CONF_MEMORY_PATHS = "memory_paths"
-CONF_MEMORY_IMAGES_ENCODED = "memory_images_encoded"
-CONF_MEMORY_STRINGS = "memory_strings"
+MAX_KEYFRAME_CANDIDATES = 50
 
 # Dispatcher signals
 SIGNAL_TIMELINE_UPDATED = f"{DOMAIN}_timeline_updated"

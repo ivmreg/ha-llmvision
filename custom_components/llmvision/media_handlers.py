@@ -6,6 +6,8 @@ import logging
 import time
 import asyncio
 import tempfile
+import heapq
+import re
 from aiofile import async_open
 from datetime import timedelta
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -22,9 +24,25 @@ import numpy as np
 from homeassistant.helpers.network import get_url
 from homeassistant.exceptions import ServiceValidationError
 
-from .const import DOMAIN
+from .const import DOMAIN, MAX_KEYFRAME_CANDIDATES
 
 _LOGGER = logging.getLogger(__name__)
+
+
+
+def _sanitize_filename(name: str) -> str:
+    """Sanitize name for safe filesystem path usage, preventing directory traversal and separator issues."""
+    if not name:
+        return "clip"
+    sanitized = name.replace("\x00", "")
+    sanitized = re.sub(r"[\\/:]+", "_", sanitized)
+    sanitized = re.sub(r"[^\w\-.]", "_", sanitized)
+    sanitized = re.sub(r"\.{2,}", "_", sanitized)
+    sanitized = re.sub(r"_+", "_", sanitized)
+    sanitized = sanitized.strip("._")
+    if len(sanitized) > 64:
+        sanitized = sanitized[:64].rstrip("._")
+    return sanitized or "clip"
 
 
 class MediaProcessor:
@@ -36,6 +54,7 @@ class MediaProcessor:
         self.filenames = []
         self.snapshots_path = f"/media/{DOMAIN}/snapshots/"
         self.key_frame = ""
+        self.saved_frames = []
 
     async def _encode_image(self, img):
         """Encode image as base64"""
@@ -75,22 +94,25 @@ class MediaProcessor:
         return img
 
     async def _expose_image(self, frame_name, image_data, uid, frame_path=None):
-        # ensure /media/llmvision/snapshots dir exists
+        snapshots_dir = self.snapshots_path.rstrip("/\\")
         await self.hass.loop.run_in_executor(
             None,
-            partial(os.makedirs, f"/media/{DOMAIN}/snapshots", exist_ok=True),
+            partial(os.makedirs, snapshots_dir, exist_ok=True),
         )
-        if self.key_frame == "":
-            filename = f"/media/{DOMAIN}/snapshots/{uid}-{frame_name}.jpg"
+        filename = f"{snapshots_dir}/{uid}-{frame_name}.jpg"
+        if image_data is None and frame_path is not None:
+            # open image in hass.loop
+            with await self.hass.loop.run_in_executor(
+                None, Image.open, frame_path
+            ) as image:
+                await self.hass.loop.run_in_executor(None, image.load)
+                image_data = await self._encode_image(image)
+        await self._save_clip(image_data=image_data, image_path=filename)
+        if filename not in self.saved_frames:
+            self.saved_frames.append(filename)
+        if not self.key_frame:
             self.key_frame = filename
-            if image_data is None and frame_path is not None:
-                # open image in hass.loop
-                with await self.hass.loop.run_in_executor(
-                    None, Image.open, frame_path
-                ) as image:
-                    await self.hass.loop.run_in_executor(None, image.load)
-                    image_data = await self._encode_image(image)
-            await self._save_clip(image_data=image_data, image_path=filename)
+        return filename
 
     def _similarity_score(self, previous_frame, current_frame_gray):
         """
@@ -498,13 +520,16 @@ class MediaProcessor:
                 self.client.add_frame(base64_image=resized_image, filename=frame_name)
 
             if expose_images:
-                key_name = selected_frames[key_idx][0]
-                key_b64 = resized_base64[key_idx]
-                await self._expose_image(
-                    frame_name=key_name.split("-")[0],
-                    image_data=key_b64,
-                    uid=str(uuid.uuid4())[:8],
-                )
+                uid = str(uuid.uuid4())[:8]
+                start_saved_len = len(self.saved_frames)
+                for idx, (frame_name, _, _) in enumerate(selected_frames, start=1):
+                    await self._expose_image(
+                        frame_name=f"{frame_name}",
+                        image_data=resized_base64[idx - 1],
+                        uid=uid,
+                    )
+                if start_saved_len + key_idx < len(self.saved_frames):
+                    self.key_frame = self.saved_frames[start_saved_len + key_idx]
 
     async def add_images(
         self, image_entities, image_paths, target_width, include_filename, expose_images
@@ -615,6 +640,7 @@ class MediaProcessor:
         target_width=640,
         include_filename=False,
         expose_images=False,
+        override_filename="",
     ):
         try:
             current_event_id = str(uuid.uuid4())
@@ -741,10 +767,15 @@ class MediaProcessor:
                 )
 
             previous_frame = None
-            frames = []
+            candidate_heap = []
             frame_counter = 0
             jpeg_buffer = b""
             first_frame = None
+
+            max_candidates = max(
+                max_frames or 1,
+                min((max_frames or 5) * 10, MAX_KEYFRAME_CANDIDATES),
+            )
 
             def find_jpeg_frames(data):
                 frames = []
@@ -765,7 +796,7 @@ class MediaProcessor:
                     _LOGGER.error("ffmpeg stdout is not a PIPE; cannot read frames")
                     await ffmpeg_process.wait()
                     raise ServiceValidationError("ffmpeg stdout not available")
-                # Read until ffmpeg closes stdout
+                # Read until ffmpeg closes stdout (evaluate full clip / drain to EOF)
                 while True:
                     try:
                         chunk = await asyncio.wait_for(
@@ -795,9 +826,15 @@ class MediaProcessor:
                                 score = self._similarity_score(
                                     previous_frame, current_frame_gray
                                 )
-                                frames.append((jpeg_data, score, frame_counter))
+                                candidate_item = (jpeg_data, score, frame_counter)
+                                heap_entry = (-score, -frame_counter, candidate_item)
+                                if len(candidate_heap) < max_candidates:
+                                    heapq.heappush(candidate_heap, heap_entry)
+                                else:
+                                    if score < -candidate_heap[0][0]:
+                                        heapq.heappushpop(candidate_heap, heap_entry)
                                 _LOGGER.debug(
-                                    f"Appended frame {frame_counter} (score={score:.6f}, bytes={len(jpeg_data)})"
+                                    f"Evaluated frame {frame_counter} (score={score:.6f}, bytes={len(jpeg_data)})"
                                 )
                             else:
                                 # First frame, always include
@@ -813,8 +850,6 @@ class MediaProcessor:
                                 f"Cannot identify image from ffmpeg pipe at frame {frame_counter}"
                             )
                             continue
-                        if frame_counter >= max_frames:
-                            break
                 await ffmpeg_process.wait()
 
                 if (
@@ -856,12 +891,13 @@ class MediaProcessor:
             ffmpeg_time = time.monotonic_ns() - ffmpeg_start
             _LOGGER.debug(f"FFmpeg took {ffmpeg_time / 1_000_000:.2f} ms")
 
+            frames = [item[2] for item in candidate_heap]
             if len(frames) == 0 and first_frame is None:
                 raise ServiceValidationError("No frames extracted from video.")
 
             # Log all frames with scores
             for fdata, fscore, findex in frames:
-                _LOGGER.debug(f"Extracted frame {findex} with SSIM score {fscore:.6f}")
+                _LOGGER.debug(f"Candidate frame {findex} with SSIM score {fscore:.6f}")
 
             # Sort scored frames by SSIM
             frames.sort(key=lambda x: x[1])
@@ -887,29 +923,42 @@ class MediaProcessor:
                     target_width=target_width, image_data=frame_data
                 )
                 resized_base64.append(resized_image)
+                if override_filename:
+                    filename = f"{override_filename} (frame {idx})"
+                elif include_filename:
+                    filename = f"{os.path.splitext(os.path.basename(video_path))[0]} (frame {idx})"
+                else:
+                    filename = f"Video frame {idx}"
                 self.client.add_frame(
                     base64_image=resized_image,
-                    filename=(
-                        f"{os.path.splitext(os.path.basename(video_path))[0]} (frame {idx})"
-                        if include_filename
-                        else f"Video frame {idx}"
-                    ),
+                    filename=filename,
                 )
 
             if expose_images and selected_frames:
-                # Expose keyframe if requested
+                uid = str(uuid.uuid4())[:8]
                 reference_bytes = selected_frames[0][0]
                 candidate_bytes = [fd for (fd, _, _) in selected_frames]
                 key_idx = await self._select_keyframe_index(
                     reference_bytes, candidate_bytes
                 )
-                # selected_frames items are (frame_bytes, score, original_index)
-                frame_idx_label = (selected_frames[key_idx][2] or 0) + 1
-                await self._expose_image(
-                    frame_name=str(frame_idx_label),
-                    image_data=resized_base64[key_idx],
-                    uid=str(uuid.uuid4())[:8],
+                raw_base_name = (
+                    override_filename
+                    if override_filename
+                    else os.path.splitext(os.path.basename(video_path))[0]
                 )
+                safe_base_name = _sanitize_filename(raw_base_name)
+                exposed_video_frames = []
+                for idx, (frame_data, _, orig_idx) in enumerate(selected_frames, start=1):
+                    frame_idx_label = (orig_idx if orig_idx is not None else idx - 1) + 1
+                    written_file = await self._expose_image(
+                        frame_name=f"{safe_base_name}-frame_{frame_idx_label}",
+                        image_data=resized_base64[idx - 1],
+                        uid=uid,
+                    )
+                    if written_file:
+                        exposed_video_frames.append(written_file)
+                if exposed_video_frames and 0 <= key_idx < len(exposed_video_frames):
+                    self.key_frame = exposed_video_frames[key_idx]
         except Exception as e:
             raise ServiceValidationError(f"Error processing video {video_path}: {e}")
 
@@ -926,6 +975,8 @@ class MediaProcessor:
 
         if not video_paths:
             video_paths = []
+        else:
+            video_paths = list(video_paths)
 
         base_url = get_url(self.hass)
 
@@ -937,8 +988,9 @@ class MediaProcessor:
 
         _LOGGER.debug(f"Processing videos: {video_paths}")
 
-        def process_video(video_path):
-            return self.add_video(
+        # Process videos sequentially in input order for deterministic aggregation
+        for video_path in video_paths:
+            await self.add_video(
                 video_path=video_path,
                 base_url=base_url,
                 max_frames=max_frames,
@@ -946,9 +998,6 @@ class MediaProcessor:
                 include_filename=include_filename,
                 expose_images=expose_images,
             )
-
-        # Process videos in parallel
-        await asyncio.gather(*map(process_video, video_paths))
 
         return self.client
 
