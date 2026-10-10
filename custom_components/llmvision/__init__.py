@@ -5,6 +5,7 @@ from .providers import Request
 from .memory import Memory
 from .media_handlers import MediaProcessor
 import os, re
+import time
 from datetime import timedelta
 from homeassistant.util import dt as dt_util
 from homeassistant.config_entries import ConfigEntry
@@ -840,6 +841,7 @@ def setup(hass, config):
 
     async def stream_analyzer(data_call):
         """Handle the service call to analyze a stream"""
+        t_total_start = time.monotonic()
         start = dt_util.now()
         call = ServiceCallData(data_call).get_service_call_data()
 
@@ -882,14 +884,32 @@ def setup(hass, config):
         if processor.saved_frames:
             response["saved_frames"] = processor.saved_frames
 
-        await _create_event(
-            hass=hass,
-            call=call,  # type: ignore
-            start=start,
-            response=response,
-            key_frame=processor.key_frame,
-            saved_frames=processor.saved_frames,
-        )
+        t_tl0 = time.monotonic()
+        try:
+            await _create_event(
+                hass=hass,
+                call=call,  # type: ignore
+                start=start,
+                response=response,
+                key_frame=processor.key_frame,
+                saved_frames=processor.saved_frames,
+            )
+        finally:
+            timeline_save_s = round(time.monotonic() - t_tl0, 3)
+
+        t_total_s = round(time.monotonic() - t_total_start, 3)
+        timings = {}
+        for k, v in getattr(processor, "timings", {}).items():
+            timings[k] = round(v, 3)
+        req_timings = getattr(request, "timings", {})
+        timings["vision_request_s"] = round(req_timings.get("vision_request_s", 0.0), 3)
+        timings["title_request_s"] = round(req_timings.get("title_request_s", 0.0), 3)
+        timings["timeline_save_s"] = timeline_save_s
+        timings["total_analyzer_s"] = t_total_s
+        accounted = sum(v for k, v in timings.items() if k != "total_analyzer_s")
+        timings["overhead_s"] = max(0.0, round(t_total_s - accounted, 3))
+        response["timings"] = timings
+
         return response
 
     async def data_analyzer(data_call):

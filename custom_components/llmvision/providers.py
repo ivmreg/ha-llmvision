@@ -11,6 +11,7 @@ import inspect
 import re
 import json
 import base64
+import time
 from .const import (
     DOMAIN,
     CONF_API_KEY,
@@ -80,6 +81,7 @@ class Request:
         self.temperature = temperature
         self.base64_images = []
         self.filenames = []
+        self.timings = {"vision_request_s": 0.0, "title_request_s": 0.0}
 
     @staticmethod
     def sanitize_data(data):
@@ -154,6 +156,13 @@ class Request:
         if not call.provider:
             raise ServiceValidationError(ERROR_NOT_CONFIGURED)
 
+    async def _timed_provider_request(self, stage, callback, call):
+        start = time.monotonic()
+        try:
+            return await callback(call)
+        finally:
+            self.timings[stage] = self.timings.get(stage, 0.0) + (time.monotonic() - start)
+
     async def call(self, call: Any, _is_fallback_retry: bool = False):
         """
         Forwards a request to the specified provider and optionally generates a title.
@@ -205,7 +214,9 @@ class Request:
 
         try:
             # Make call to provider
-            response_text = await provider_instance.vision_request(call)
+            response_text = await self._timed_provider_request(
+                "vision_request_s", provider_instance.vision_request, call
+            )
         except Exception as e:
             _LOGGER.error(f"Provider {provider_name} failed: {e}")
             # Try fallback if configured and not already tried
@@ -264,7 +275,9 @@ class Request:
                     + "Create a title for this text: "
                     + response_text
                 )
-                gen_title = await provider_instance.title_request(call)
+                gen_title = await self._timed_provider_request(
+                    "title_request_s", provider_instance.title_request, call
+                )
         except Exception as e:
             _LOGGER.error(f"Provider {provider_name} failed to generate title: {e}")
             # Try fallback if configured and not already tried
