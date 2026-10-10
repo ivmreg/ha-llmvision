@@ -1223,3 +1223,886 @@ class TestMigration:
         cleanup_mock.assert_awaited_once()
         assert await tl._get_db_version() == DB_VERSION
         assert not tl._migrating
+
+
+# ===========================================================================
+# Frame Ownership Lifecycle (Finding 6)
+# ===========================================================================
+
+
+class TestFrameOwnershipLifecycle:
+    """Tests for complete frame ownership lifecycle, event_images association,
+    migration, restart persistence, cleanup protection, safe deletion, and unshared asset handling."""
+
+    async def test_legacy_db_migration(self, build_timeline):
+        """Legacy DB migration from v4 schema without event_images table to v5 schema.
+        Verifies that:
+        - event_images table is created.
+        - Existing key_frame paths are migrated into event_images.
+        - User version is updated to DB_VERSION (5).
+        - Existing events and their attributes are preserved.
+        - get_linked_images returns migrated key_frames.
+        """
+        tl = build_timeline()
+        await tl._initialize_db()
+
+        # Simulate legacy v4 schema by dropping event_images table and setting user_version to 4
+        async with aiosqlite.connect(tl._db_path) as db:
+            await db.execute("DROP TABLE IF EXISTS event_images")
+            await db.execute("DROP INDEX IF EXISTS idx_event_images_uid")
+            await db.execute("DROP INDEX IF EXISTS idx_event_images_path")
+            await db.execute("PRAGMA user_version = 4")
+            await db.commit()
+
+        # Insert legacy rows with key_frame
+        legacy_rows = [
+            _make_row(
+                "legacy event 1",
+                0.2,
+                key_frame="/media/llmvision/snapshots/legacy1.jpg",
+            ),
+            _make_row(
+                "legacy event 2",
+                0.1,
+                key_frame="/media/llmvision/snapshots/legacy2.jpg",
+            ),
+            _make_row(
+                "legacy event no image",
+                0.05,
+                key_frame="",
+            ),
+        ]
+        await _insert_rows(tl._db_path, legacy_rows)
+
+        # Trigger migration
+        tl._migrating = True
+        await tl._migrate()
+
+        assert not tl._migrating
+        assert await tl._get_db_version() == DB_VERSION
+        assert await tl._has_latest_schema()
+
+        # Verify event_images rows exist
+        async with aiosqlite.connect(tl._db_path) as db:
+            async with db.execute(
+                "SELECT event_uid, image_path FROM event_images ORDER BY image_path"
+            ) as cur:
+                migrated_images = await cur.fetchall()
+
+        assert len(migrated_images) == 2
+        assert migrated_images[0][1] == "/media/llmvision/snapshots/legacy1.jpg"
+        assert migrated_images[1][1] == "/media/llmvision/snapshots/legacy2.jpg"
+
+        # Verify linked images
+        linked = await tl.get_linked_images()
+        assert "legacy1.jpg" in linked
+        assert "legacy2.jpg" in linked
+
+    async def test_multiple_frames_linked_after_restart(
+        self, build_timeline, tmp_path
+    ):
+        """Verifies that an event with multiple saved_frames persists all frames to SQLite,
+        and all frames remain linked and accessible after a simulated restart/reload.
+        """
+        media_path = tmp_path / "snapshots"
+        media_path.mkdir()
+
+        tl = build_timeline()
+        tl._media_path = str(media_path)
+        await tl._initialize_db()
+
+        now = dt_util.utcnow()
+        frame1 = str(media_path / "frame1.jpg")
+        frame2 = str(media_path / "frame2.jpg")
+        frame3 = str(media_path / "frame3.jpg")
+
+        await tl.create_event(
+            start=now,
+            end=now + datetime.timedelta(minutes=1),
+            title="Motion detected with multi frames",
+            description="3 frames recorded",
+            key_frame=frame1,
+            camera_name="front_door",
+            label="person",
+            saved_frames=[frame1, frame2, frame3],
+        )
+
+        assert len(tl.events) == 1
+        created_event = tl.events[0]
+        assert created_event.key_frame == frame1
+        assert set(created_event.saved_frames) == {frame1, frame2, frame3}
+
+        # Simulate restart: new Timeline instance pointing to the same database
+        tl_restarted = build_timeline()
+        tl_restarted._media_path = str(media_path)
+        await tl_restarted.load_events()
+
+        assert len(tl_restarted.events) == 1
+        reloaded_event = tl_restarted.events[0]
+        assert reloaded_event.uid == created_event.uid
+        assert reloaded_event.key_frame == frame1
+        assert set(reloaded_event.saved_frames) == {frame1, frame2, frame3}
+
+        # Verify get_linked_images includes all 3 frames
+        linked_images = await tl_restarted.get_linked_images()
+        assert "frame1.jpg" in linked_images
+        assert "frame2.jpg" in linked_images
+        assert "frame3.jpg" in linked_images
+
+        # Verify get_event API returns saved_frames
+        event_dict = await tl_restarted.get_event(created_event.uid)
+        assert event_dict is not None
+        assert event_dict["key_frame"] == frame1
+        assert set(event_dict["saved_frames"]) == {frame1, frame2, frame3}
+
+    async def test_cleanup_preserves_old_linked_images_and_removes_orphans(
+        self, build_timeline, tmp_path
+    ):
+        """Verifies that _cleanup preserves ALL linked frames (keyframe and secondary saved_frames)
+        even when they are older than the grace period, while safely removing unlinked orphan files.
+        """
+        media_path = tmp_path / "snapshots"
+        media_path.mkdir()
+
+        tl = build_timeline()
+        tl._media_path = str(media_path)
+        await tl._initialize_db()
+
+        # Create files on disk
+        key_frame_file = media_path / "key_frame.jpg"
+        extra_frame_file = media_path / "extra_frame.jpg"
+        orphan_file = media_path / "orphan.jpg"
+
+        key_frame_file.write_bytes(b"key")
+        extra_frame_file.write_bytes(b"extra")
+        orphan_file.write_bytes(b"orphan")
+
+        # Backdate timestamps past the 30-second grace window (100 seconds ago)
+        old_ts = datetime.datetime.now().timestamp() - 100
+        for f in (key_frame_file, extra_frame_file, orphan_file):
+            os.utime(str(f), (old_ts, old_ts))
+
+        # Register event referencing key_frame_file and extra_frame_file
+        now = dt_util.utcnow()
+        await tl.create_event(
+            start=now,
+            end=now + datetime.timedelta(minutes=1),
+            title="Multi frame event",
+            description="Testing cleanup protection",
+            key_frame=str(key_frame_file),
+            camera_name="camera",
+            label="car",
+            saved_frames=[str(key_frame_file), str(extra_frame_file)],
+        )
+
+        tl._migrating = False
+        await tl._cleanup()
+
+        # Assert orphan is removed
+        assert not orphan_file.exists()
+        # Assert linked frames (both key and secondary) are protected
+        assert key_frame_file.exists()
+        assert extra_frame_file.exists()
+
+    async def test_deletion_and_expiration_of_unshared_assets(
+        self, build_timeline, tmp_path
+    ):
+        """Verifies deletion and expiration lifecycle for unshared assets:
+        1. delete_event removes all unshared frames from disk and DB.
+        2. _purge_expired_events removes all unshared frames from disk and DB.
+        """
+        media_path = tmp_path / "snapshots"
+        media_path.mkdir()
+
+        tl = build_timeline(retention=2)
+        tl._media_path = str(media_path)
+        await tl._initialize_db()
+
+        # Part 1: delete_event removes unshared assets
+        del_kf = media_path / "del_kf.jpg"
+        del_sf = media_path / "del_sf.jpg"
+        del_kf.write_bytes(b"del_kf")
+        del_sf.write_bytes(b"del_sf")
+
+        now = dt_util.utcnow()
+        await tl.create_event(
+            start=now,
+            end=now + datetime.timedelta(minutes=1),
+            title="To be manually deleted",
+            description="",
+            key_frame=str(del_kf),
+            camera_name="camera1",
+            label="person",
+            saved_frames=[str(del_kf), str(del_sf)],
+        )
+        del_uid = tl.events[0].uid
+
+        res = await tl.delete_event(del_uid)
+        assert res is True
+        assert not del_kf.exists()
+        assert not del_sf.exists()
+        assert await tl.get_event(del_uid) is None
+
+        # Verify DB rows are removed
+        async with aiosqlite.connect(tl._db_path) as db:
+            async with db.execute(
+                "SELECT 1 FROM event_images WHERE event_uid = ?", (del_uid,)
+            ) as cur:
+                assert await cur.fetchone() is None
+            async with db.execute(
+                "SELECT 1 FROM events WHERE uid = ?", (del_uid,)
+            ) as cur:
+                assert await cur.fetchone() is None
+
+        # Part 2: _purge_expired_events removes unshared assets
+        exp_kf = media_path / "exp_kf.jpg"
+        exp_sf = media_path / "exp_sf.jpg"
+        exp_kf.write_bytes(b"exp_kf")
+        exp_sf.write_bytes(b"exp_sf")
+
+        # Create expired event (5 days old with retention=2)
+        past = now - datetime.timedelta(days=5)
+        orig_migrating = getattr(tl, "_migrating", False)
+        tl._migrating = True
+        try:
+            await tl.create_event(
+                start=past,
+                end=past + datetime.timedelta(minutes=1),
+                title="Old expired event",
+                description="",
+                key_frame=str(exp_kf),
+                camera_name="camera1",
+                label="person",
+                saved_frames=[str(exp_kf), str(exp_sf)],
+            )
+            exp_uid = next(e.uid for e in tl.events if e.title == "Old expired event")
+        finally:
+            tl._migrating = orig_migrating
+
+        # Verify files and SQLite events + event_images rows exist before purge
+        assert exp_kf.exists()
+        assert exp_sf.exists()
+        async with aiosqlite.connect(tl._db_path) as db:
+            async with db.execute(
+                "SELECT 1 FROM events WHERE uid = ?", (exp_uid,)
+            ) as cur:
+                assert await cur.fetchone() is not None
+            async with db.execute(
+                "SELECT 1 FROM event_images WHERE event_uid = ?", (exp_uid,)
+            ) as cur:
+                assert await cur.fetchone() is not None
+
+        # Load events triggers _purge_expired_events
+        await tl.load_events()
+
+        # Verify files removed and SQLite events + event_images rows absent after purge
+        assert not exp_kf.exists()
+        assert not exp_sf.exists()
+        assert await tl.get_event(exp_uid) is None
+        async with aiosqlite.connect(tl._db_path) as db:
+            async with db.execute(
+                "SELECT 1 FROM events WHERE uid = ?", (exp_uid,)
+            ) as cur:
+                assert await cur.fetchone() is None
+            async with db.execute(
+                "SELECT 1 FROM event_images WHERE event_uid = ?", (exp_uid,)
+            ) as cur:
+                assert await cur.fetchone() is None
+
+    async def test_shared_assets_not_prematurely_removed_and_outside_root_preserved(
+        self, build_timeline, tmp_path
+    ):
+        """Verifies that:
+        - When an asset is shared across multiple events, deleting one event does NOT delete
+          the shared asset until the last owner event is deleted.
+        - Assets stored outside the configured snapshots root are never deleted from disk
+          when events are deleted or expired.
+        """
+        media_path = tmp_path / "snapshots"
+        media_path.mkdir()
+        outside_path = tmp_path / "outside_custom"
+        outside_path.mkdir()
+
+        tl = build_timeline()
+        tl._media_path = str(media_path)
+        await tl._initialize_db()
+
+        # Shared assets setup
+        shared_file = media_path / "shared_frame.jpg"
+        e1_file = media_path / "e1_only.jpg"
+        e2_file = media_path / "e2_only.jpg"
+        outside_file = outside_path / "outside_image.jpg"
+
+        shared_file.write_bytes(b"shared")
+        e1_file.write_bytes(b"e1")
+        e2_file.write_bytes(b"e2")
+        outside_file.write_bytes(b"outside")
+
+        now = dt_util.utcnow()
+
+        # Event 1 owns shared_file and e1_file
+        await tl.create_event(
+            start=now,
+            end=now + datetime.timedelta(minutes=1),
+            title="Event 1",
+            description="",
+            key_frame=str(e1_file),
+            camera_name="camera",
+            label="car",
+            saved_frames=[str(e1_file), str(shared_file)],
+        )
+        e1_uid = tl.events[0].uid
+
+        # Event 2 owns shared_file, e2_file, and outside_file
+        await tl.create_event(
+            start=now + datetime.timedelta(minutes=2),
+            end=now + datetime.timedelta(minutes=3),
+            title="Event 2",
+            description="",
+            key_frame=str(e2_file),
+            camera_name="camera",
+            label="car",
+            saved_frames=[str(e2_file), str(shared_file), str(outside_file)],
+        )
+        e2_uid = next(e.uid for e in tl.events if e.title == "Event 2")
+
+        # Delete Event 1
+        res1 = await tl.delete_event(e1_uid)
+        assert res1 is True
+
+        # e1_only must be deleted
+        assert not e1_file.exists()
+        # shared_file must still exist because Event 2 still references it!
+        assert shared_file.exists()
+        assert e2_file.exists()
+        assert outside_file.exists()
+
+        # Delete Event 2
+        res2 = await tl.delete_event(e2_uid)
+        assert res2 is True
+
+        # e2_only must be deleted
+        assert not e2_file.exists()
+        # shared_file now has no owners and must be deleted!
+        assert not shared_file.exists()
+        # outside_file is outside the snapshots root and must be PRESERVED!
+        assert outside_file.exists()
+
+    async def test_db_failure_does_not_silently_remove_media(
+        self, build_timeline, tmp_path, monkeypatch
+    ):
+        """Verifies that if the database transaction fails during delete_event,
+        no filesystem media files are deleted.
+        """
+        media_path = tmp_path / "snapshots"
+        media_path.mkdir()
+
+        tl = build_timeline()
+        tl._media_path = str(media_path)
+        await tl._initialize_db()
+
+        frame_file = media_path / "valuable_frame.jpg"
+        frame_file.write_bytes(b"valuable")
+
+        now = dt_util.utcnow()
+        await tl.create_event(
+            start=now,
+            end=now + datetime.timedelta(minutes=1),
+            title="Event with media",
+            description="",
+            key_frame=str(frame_file),
+            camera_name="cam",
+            label="person",
+            saved_frames=[str(frame_file)],
+        )
+        uid = tl.events[0].uid
+
+        # Simulate DB failure during delete_event by monkeypatching aiosqlite execute
+        original_connect = aiosqlite.connect
+
+        class FailingConnect:
+            def __init__(self, path):
+                self._conn = original_connect(path)
+
+            async def __aenter__(self):
+                conn = await self._conn.__aenter__()
+                original_execute = conn.execute
+
+                def failing_execute(query, *args, **kwargs):
+                    if "DELETE FROM events" in query:
+                        raise aiosqlite.OperationalError(
+                            "database is locked (simulated)"
+                        )
+                    return original_execute(query, *args, **kwargs)
+
+                conn.execute = failing_execute
+                return conn
+
+            async def __aexit__(self, exc_type, exc_val, exc_tb):
+                return await self._conn.__aexit__(exc_type, exc_val, exc_tb)
+
+        monkeypatch.setattr(
+            "custom_components.llmvision.timeline.aiosqlite.connect",
+            FailingConnect,
+        )
+
+        success = await tl.delete_event(uid)
+        assert success is False
+        # Valuable media file must NOT have been removed!
+        assert frame_file.exists()
+
+    async def test_two_instances_concurrent_gated_owner_shared_asset_survives(
+        self, build_timeline, tmp_path
+    ):
+        """Verifies that two Timeline instances sharing the same hass.data mutation lock
+        coordinate ownership properly, ensuring a shared asset is not removed when one instance deletes its event.
+        """
+        media_path = tmp_path / "snapshots"
+        media_path.mkdir()
+
+        tl_a = build_timeline()
+        tl_a._media_path = str(media_path)
+        await tl_a._initialize_db()
+
+        # Instance B shares the exact same hass instance and db_path
+        tl_b = Timeline(tl_a.hass, tl_a._config_entry)
+        tl_b._migrating = False
+        tl_b._media_path = str(media_path)
+
+        shared_file = media_path / "shared_camera.jpg"
+        a_only = media_path / "a_only.jpg"
+        b_only = media_path / "b_only.jpg"
+
+        shared_file.write_bytes(b"shared")
+        a_only.write_bytes(b"a")
+        b_only.write_bytes(b"b")
+
+        now = dt_util.utcnow()
+        await tl_a.create_event(
+            start=now,
+            end=now + datetime.timedelta(minutes=1),
+            title="Event A",
+            description="",
+            key_frame=str(a_only),
+            camera_name="cam",
+            label="person",
+            saved_frames=[str(a_only), str(shared_file)],
+        )
+        uid_a = tl_a.events[0].uid
+
+        await tl_b.create_event(
+            start=now + datetime.timedelta(minutes=2),
+            end=now + datetime.timedelta(minutes=3),
+            title="Event B",
+            description="",
+            key_frame=str(b_only),
+            camera_name="cam",
+            label="person",
+            saved_frames=[str(b_only), str(shared_file)],
+        )
+        await tl_b.load_events()
+        uid_b = next(e.uid for e in tl_b.events if e.title == "Event B")
+
+        # Instance A deletes Event A
+        res_a = await tl_a.delete_event(uid_a)
+        assert res_a is True
+        assert not a_only.exists()
+        # Shared asset must survive because Instance B owns it!
+        assert shared_file.exists()
+
+        # Instance B deletes Event B
+        res_b = await tl_b.delete_event(uid_b)
+        assert res_b is True
+        assert not b_only.exists()
+        assert not shared_file.exists()
+
+    async def test_insert_event_rollback_on_sql_failure_does_not_claim_success(
+        self, build_timeline, tmp_path, monkeypatch
+    ):
+        """Verifies that if inserting into event_images fails, the whole event is rolled back
+        and an exception is raised, preventing untracked events.
+        """
+        media_path = tmp_path / "snapshots"
+        media_path.mkdir()
+
+        tl = build_timeline()
+        tl._media_path = str(media_path)
+        await tl._initialize_db()
+
+        frame_file = media_path / "frame.jpg"
+        frame_file.write_bytes(b"data")
+
+        original_connect = aiosqlite.connect
+
+        class FailingConnect:
+            def __init__(self, path):
+                self._conn = original_connect(path)
+
+            async def __aenter__(self):
+                conn = await self._conn.__aenter__()
+                original_executemany = conn.executemany
+
+                def failing_executemany(query, *args, **kwargs):
+                    if "event_images" in query:
+                        raise aiosqlite.OperationalError(
+                            "simulated event_images insert failure"
+                        )
+                    return original_executemany(query, *args, **kwargs)
+
+                conn.executemany = failing_executemany
+                return conn
+
+            async def __aexit__(self, exc_type, exc_val, exc_tb):
+                return await self._conn.__aexit__(exc_type, exc_val, exc_tb)
+
+        monkeypatch.setattr(
+            "custom_components.llmvision.timeline.aiosqlite.connect",
+            FailingConnect,
+        )
+
+        now = dt_util.utcnow()
+        with pytest.raises(aiosqlite.OperationalError):
+            await tl.create_event(
+                start=now,
+                end=now + datetime.timedelta(minutes=1),
+                title="Should fail",
+                description="",
+                key_frame=str(frame_file),
+                camera_name="cam",
+                label="car",
+                saved_frames=[str(frame_file)],
+            )
+
+        # Ensure no event was committed to DB
+        async with aiosqlite.connect(tl._db_path) as db:
+            async with db.execute("SELECT COUNT(*) FROM events") as cur:
+                count = (await cur.fetchone())[0]
+                assert count == 0
+
+    async def test_cleanup_fail_closed_on_locked_or_corrupt_db(
+        self, build_timeline, tmp_path, monkeypatch
+    ):
+        """Verifies that if the database read fails during _cleanup, cleanup fails closed
+        and deletes NO files from the snapshots directory.
+        """
+        media_path = tmp_path / "snapshots"
+        media_path.mkdir()
+
+        tl = build_timeline()
+        tl._media_path = str(media_path)
+        await tl._initialize_db()
+
+        stale_file = media_path / "stale_snapshot.jpg"
+        stale_file.write_bytes(b"stale")
+        old_ts = datetime.datetime.now().timestamp() - 100
+        os.utime(str(stale_file), (old_ts, old_ts))
+
+        original_connect = aiosqlite.connect
+
+        class BrokenConnect:
+            def __init__(self, path):
+                self._conn = original_connect(path)
+
+            async def __aenter__(self):
+                raise aiosqlite.OperationalError("database disk image is malformed")
+
+            async def __aexit__(self, exc_type, exc_val, exc_tb):
+                pass
+
+        monkeypatch.setattr(
+            "custom_components.llmvision.timeline.aiosqlite.connect",
+            BrokenConnect,
+        )
+
+        tl._migrating = False
+        await tl._cleanup()
+
+        # In fail-closed design, the file must survive because DB query failed!
+        assert stale_file.exists()
+
+    async def test_path_normalization_alias_shared_asset_not_deleted(
+        self, build_timeline, tmp_path
+    ):
+        """Verifies that two events referring to the same image via alias/relative path
+        are recognized as sharing the asset via canonical normalization, preventing premature deletion.
+        """
+        media_path = tmp_path / "snapshots"
+        media_path.mkdir()
+
+        tl = build_timeline()
+        tl._media_path = str(media_path)
+        await tl._initialize_db()
+
+        frame_file = media_path / "aliased.jpg"
+        frame_file.write_bytes(b"aliased")
+
+        # Path with '/./' alias
+        aliased_path = os.path.join(str(media_path), ".", "aliased.jpg")
+        direct_path = str(frame_file)
+
+        now = dt_util.utcnow()
+        await tl.create_event(
+            start=now,
+            end=now + datetime.timedelta(minutes=1),
+            title="Event 1 aliased",
+            description="",
+            key_frame=aliased_path,
+            camera_name="cam",
+            label="person",
+            saved_frames=[aliased_path],
+        )
+        uid_1 = tl.events[0].uid
+
+        await tl.create_event(
+            start=now + datetime.timedelta(minutes=2),
+            end=now + datetime.timedelta(minutes=3),
+            title="Event 2 direct",
+            description="",
+            key_frame=direct_path,
+            camera_name="cam",
+            label="person",
+            saved_frames=[direct_path],
+        )
+        uid_2 = next(e.uid for e in tl.events if e.title == "Event 2 direct")
+
+        # Deleting Event 1 must NOT delete the file because Event 2 references the canonical path!
+        res1 = await tl.delete_event(uid_1)
+        assert res1 is True
+        assert frame_file.exists()
+
+        # Deleting Event 2 now deletes the file
+        res2 = await tl.delete_event(uid_2)
+        assert res2 is True
+        assert not frame_file.exists()
+
+    async def test_update_event_retains_untouched_frames_on_metadata_update(
+        self, build_timeline, tmp_path
+    ):
+        """Verifies that update_event preserves existing saved_frames when updating metadata,
+        and only replaces them when an explicit saved_frames list is passed.
+        """
+        media_path = tmp_path / "snapshots"
+        media_path.mkdir()
+
+        tl = build_timeline()
+        tl._media_path = str(media_path)
+        await tl._initialize_db()
+
+        frame1 = str(media_path / "f1.jpg")
+        frame2 = str(media_path / "f2.jpg")
+        frame3 = str(media_path / "f3.jpg")
+
+        now = dt_util.utcnow()
+        await tl.create_event(
+            start=now,
+            end=now + datetime.timedelta(minutes=1),
+            title="Original Title",
+            description="desc",
+            key_frame=frame1,
+            camera_name="cam",
+            label="car",
+            saved_frames=[frame1, frame2],
+        )
+        uid = tl.events[0].uid
+
+        # Metadata-only update (saved_frames not passed)
+        await tl.update_event(
+            uid=uid,
+            start=now,
+            end=now + datetime.timedelta(minutes=1),
+            title="Updated Title",
+            description="updated desc",
+            key_frame=frame1,
+            camera_name="cam",
+            label="car",
+        )
+        ev = await tl.get_event(uid)
+        assert ev["title"] == "Updated Title"
+        # Untouched frames must be retained!
+        assert len(ev["saved_frames"]) == 2
+
+        # Explicit replacement list given
+        await tl.update_event(
+            uid=uid,
+            start=now,
+            end=now + datetime.timedelta(minutes=1),
+            title="Updated Title 2",
+            description="updated desc",
+            key_frame=frame3,
+            camera_name="cam",
+            label="car",
+            saved_frames=[frame3],
+        )
+        ev2 = await tl.get_event(uid)
+        assert ev2["key_frame"] == frame3
+        assert len(ev2["saved_frames"]) == 1
+
+    async def test_migration_failure_does_not_mark_v5_success(
+        self, build_timeline, monkeypatch
+    ):
+        """Verifies that if creating or populating event_images during v5 migration fails,
+        user_version is NOT marked as 5, ensuring migration failure is not masked.
+        """
+        tl = build_timeline()
+        await tl._initialize_db()
+
+        # Revert schema to v4
+        async with aiosqlite.connect(tl._db_path) as db:
+            await db.execute("DROP TABLE IF EXISTS event_images")
+            await db.execute("PRAGMA user_version = 4")
+            await db.commit()
+
+        # Monkeypatch aiosqlite to simulate error during event_images creation
+        original_connect = aiosqlite.connect
+
+        class FailingConnect:
+            def __init__(self, path):
+                self._conn = original_connect(path)
+
+            async def __aenter__(self):
+                conn = await self._conn.__aenter__()
+                orig_execute = conn.execute
+
+                def failing_execute(query, *args, **kwargs):
+                    if "event_images" in query:
+                        raise aiosqlite.OperationalError("disk I/O error during migration")
+                    return orig_execute(query, *args, **kwargs)
+
+                conn.execute = failing_execute
+                return conn
+
+            async def __aexit__(self, exc_type, exc_val, exc_tb):
+                return await self._conn.__aexit__(exc_type, exc_val, exc_tb)
+
+        monkeypatch.setattr(
+            "custom_components.llmvision.timeline.aiosqlite.connect",
+            FailingConnect,
+        )
+
+        tl._migrating = True
+        await tl._migrate()
+
+        # Version must NOT have been updated to 5
+        version = await tl._get_db_version()
+        assert version == 4
+        assert await tl._has_latest_schema() is False
+
+    async def test_legacy_fallback_reads_allowed_when_event_images_missing(
+        self, build_timeline
+    ):
+        """Verifies that if event_images table is missing, load_events and get_event
+        still read legacy events cleanly without errors or discarding key_frame.
+        """
+        tl = build_timeline()
+        await tl._initialize_db()
+
+        # Simulate legacy v4 state without event_images table
+        async with aiosqlite.connect(tl._db_path) as db:
+            await db.execute("DROP TABLE IF EXISTS event_images")
+            await db.execute("PRAGMA user_version = 4")
+            await db.commit()
+
+        legacy_rows = [
+            _make_row(
+                "legacy motion",
+                0.1,
+                key_frame="/media/llmvision/snapshots/legacy.jpg",
+                camera="cam1",
+                category="person",
+                label="person",
+            )
+        ]
+        await _insert_rows(tl._db_path, legacy_rows)
+
+        tl._migrating = False
+        await tl.load_events()
+
+        assert len(tl.events) == 1
+        ev = tl.events[0]
+        assert ev.title == "legacy motion"
+        assert ev.key_frame == "/media/llmvision/snapshots/legacy.jpg"
+        assert ev.saved_frames == ["/media/llmvision/snapshots/legacy.jpg"]
+
+        ev_dict = await tl.get_event(ev.uid)
+        assert ev_dict is not None
+        assert ev_dict["key_frame"] == "/media/llmvision/snapshots/legacy.jpg"
+        assert ev_dict["saved_frames"] == ["/media/llmvision/snapshots/legacy.jpg"]
+
+    async def test_update_event_unknown_uid_creates_neither_event_nor_associations(
+        self, build_timeline, tmp_path
+    ):
+        """Verifies that calling update_event with an unknown or deleted UID does not create
+        an event row or any event_images rows in SQLite, preventing orphaned protected associations.
+        """
+        media_path = tmp_path / "snapshots"
+        media_path.mkdir()
+
+        tl = build_timeline()
+        tl._media_path = str(media_path)
+        await tl._initialize_db()
+
+        frame1 = str(media_path / "orphan1.jpg")
+        frame2 = str(media_path / "orphan2.jpg")
+
+        unknown_uid = str(uuid.uuid4())
+        now = dt_util.utcnow()
+
+        # Attempt to update a nonexistent event with explicit saved_frames
+        await tl.update_event(
+            uid=unknown_uid,
+            start=now,
+            end=now + datetime.timedelta(minutes=1),
+            title="Nonexistent Event",
+            description="desc",
+            key_frame=frame1,
+            camera_name="cam",
+            label="car",
+            saved_frames=[frame1, frame2],
+        )
+
+        # Assert no event exists in SQLite
+        async with aiosqlite.connect(tl._db_path) as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM events WHERE uid = ?", (unknown_uid,)
+            ) as cur:
+                count_events = (await cur.fetchone())[0]
+                assert count_events == 0
+
+            # Assert no event_images rows exist for this unknown UID
+            async with db.execute(
+                "SELECT COUNT(*) FROM event_images WHERE event_uid = ?", (unknown_uid,)
+            ) as cur:
+                count_images = (await cur.fetchone())[0]
+                assert count_images == 0
+
+            # Assert event_images has zero rows overall
+            async with db.execute("SELECT COUNT(*) FROM event_images") as cur:
+                assert (await cur.fetchone())[0] == 0
+
+        # Also test metadata-only update (saved_frames is None) with unknown UID
+        another_unknown_uid = str(uuid.uuid4())
+        await tl.update_event(
+            uid=another_unknown_uid,
+            start=now,
+            end=now + datetime.timedelta(minutes=1),
+            title="Another Nonexistent",
+            description="desc",
+            key_frame=frame1,
+            camera_name="cam",
+            label="car",
+            saved_frames=None,
+        )
+
+        async with aiosqlite.connect(tl._db_path) as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM events WHERE uid = ?", (another_unknown_uid,)
+            ) as cur:
+                assert (await cur.fetchone())[0] == 0
+            async with db.execute(
+                "SELECT COUNT(*) FROM event_images WHERE event_uid = ?",
+                (another_unknown_uid,),
+            ) as cur:
+                assert (await cur.fetchone())[0] == 0
+
+        # Memory events list should still be empty
+        assert tl.events == []
