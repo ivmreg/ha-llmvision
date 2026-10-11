@@ -432,3 +432,576 @@ def test_services_yaml_max_tokens_and_lookback_selectors():
     assert "number" in stream_fields["max_tokens"]["selector"]
     assert "number" in stream_fields["lookback"]["selector"]
     assert "0-60s" in stream_fields["lookback"]["description"]
+
+
+# ---------------------------------------------------------------------------
+# Focused regression tests for same-stream provider recovery, periodic detection,
+# healthy no-churn, and lifecycle / error isolation
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def deterministic_timer():
+    """Deterministic timer fixture patching async_track_time_interval to avoid real timer interactions."""
+    unsub = Mock()
+    with patch(
+        "custom_components.llmvision.stream_buffer.async_track_time_interval",
+        return_value=unsub,
+    ) as mock_track:
+        yield mock_track
+
+
+def _make_realistic_stream(preload_stream: bool = False, initial_hls: Any = None):
+    """Create a realistic mock stream whose outputs() reflects add_provider and dynamic mutations."""
+    stream = Mock()
+    stream.available = True
+    stream.start = AsyncMock()
+    stream.stop = Mock()
+    stream.dynamic_stream_settings = Mock()
+    stream.dynamic_stream_settings.preload_stream = preload_stream
+
+    outputs_dict = {}
+    if initial_hls is None:
+        initial_hls = Mock()
+        initial_hls.target_duration = 6.0
+        initial_hls.idle_timer = Mock()
+        initial_hls.idle_timer.start = Mock()
+        initial_hls.get_segments = Mock(return_value=[])
+
+    outputs_dict["hls"] = initial_hls
+    stream.outputs = Mock(side_effect=lambda: dict(outputs_dict))
+
+    def _add_provider(name):
+        new_provider = Mock()
+        new_provider.target_duration = 6.0
+        new_provider.idle_timer = Mock()
+        new_provider.idle_timer.start = Mock()
+        new_provider.get_segments = Mock(return_value=[])
+        outputs_dict[name] = new_provider
+        return new_provider
+
+    stream.add_provider = Mock(side_effect=_add_provider)
+    stream._outputs_dict = outputs_dict
+    return stream, initial_hls
+
+
+@pytest.mark.asyncio
+async def test_timer_registration_callback_and_stop_unsubscribe(deterministic_timer):
+    """Verify actual timer registration, periodic callback execution, and unsubscribe on stop."""
+    hass = Mock()
+    hass.is_running = True
+    hass.async_create_task = Mock(side_effect=lambda coro: asyncio.create_task(coro))
+    hass.states.get = Mock(return_value=Mock(state="idle"))
+    entry = _make_entry(["camera.test_1"])
+
+    stream, hls_provider = _make_realistic_stream(preload_stream=False)
+    camera = Mock(async_create_stream=AsyncMock(return_value=stream), stream=stream)
+
+    manager = StreamBufferManager(hass, entry)
+    with patch.object(
+        importlib.import_module("homeassistant.components.camera"),
+        "get_camera_from_entity_id",
+        return_value=camera,
+    ):
+        await manager.async_start()
+
+        # 1. Verify timer registration with 30s interval
+        deterministic_timer.assert_called_once()
+        args, _ = deterministic_timer.call_args
+        assert args[0] is hass
+        timer_callback = args[1]
+        assert args[2] == timedelta(seconds=30)
+        unsub_handle = deterministic_timer.return_value
+        assert manager._unsub_reconcile is unsub_handle
+
+        # 2. Invoke periodic timer callback
+        timer_callback()
+        assert manager._reconcile_task is not None
+        await manager._reconcile_task
+
+        # No churn on healthy lease
+        assert manager.leases["camera.test_1"].provider is hls_provider
+
+        # 3. Stop manager and verify unsubscribe
+        await manager.async_stop()
+        unsub_handle.assert_called_once()
+        assert manager._unsub_reconcile is None
+        assert manager.is_active is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scenario", ["missing", "replacement"])
+async def test_periodic_reconciliation_recovers_missing_and_replacement_provider(scenario):
+    """Verify periodic reconciliation recovers when HLS provider is missing or replaced on the same stream."""
+    hass = Mock()
+    hass.is_running = True
+    hass.states.get = Mock(return_value=Mock(state="idle"))
+    entry = _make_entry(["camera.test_1"])
+
+    stream, hls_provider1 = _make_realistic_stream(preload_stream=False)
+    camera = Mock(async_create_stream=AsyncMock(return_value=stream), stream=stream)
+
+    manager = StreamBufferManager(hass, entry)
+    with patch.object(
+        importlib.import_module("homeassistant.components.camera"),
+        "get_camera_from_entity_id",
+        return_value=camera,
+    ):
+        await manager.async_start()
+        assert manager.leases["camera.test_1"].provider is hls_provider1
+        assert manager.leases["camera.test_1"].provider is stream.outputs()["hls"]
+
+        if scenario == "missing":
+            # Core worker stopped and stripped outputs
+            stream._outputs_dict.clear()
+            assert stream.outputs() == {}
+        elif scenario == "replacement":
+            # Core allocated a new provider instance on the same stream
+            new_provider = Mock()
+            new_provider.target_duration = 6.0
+            new_provider.idle_timer = Mock()
+            new_provider.idle_timer.start = Mock()
+            new_provider.get_segments = Mock(return_value=[])
+            stream._outputs_dict["hls"] = new_provider
+            assert stream.outputs()["hls"] is new_provider
+
+        # Run periodic reconciliation
+        await manager._async_reconcile_all()
+
+        # Manager must detect change, update lease, and lease.provider must be stream.outputs()['hls']
+        assert "camera.test_1" in manager.leases
+        lease = manager.leases["camera.test_1"]
+        assert lease.provider is stream.outputs()["hls"]
+        assert lease.provider is not hls_provider1
+        assert lease.stream is stream
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scenario", ["missing", "replacement"])
+async def test_state_change_recovers_missing_and_replacement_provider(scenario):
+    """Verify state change recovers lease when current HLS output is missing or replaced on the same stream."""
+    hass = Mock()
+    hass.is_running = True
+    entry = _make_entry(["camera.test_1"])
+
+    stream, hls_provider1 = _make_realistic_stream(preload_stream=False)
+    camera = Mock(async_create_stream=AsyncMock(return_value=stream), stream=stream)
+
+    manager = StreamBufferManager(hass, entry)
+    with patch.object(
+        importlib.import_module("homeassistant.components.camera"),
+        "get_camera_from_entity_id",
+        return_value=camera,
+    ):
+        await manager.async_start()
+        assert manager.leases["camera.test_1"].provider is hls_provider1
+
+        if scenario == "missing":
+            stream._outputs_dict.clear()
+            assert stream.outputs() == {}
+        elif scenario == "replacement":
+            new_provider = Mock()
+            new_provider.target_duration = 6.0
+            new_provider.idle_timer = Mock()
+            new_provider.idle_timer.start = Mock()
+            new_provider.get_segments = Mock(return_value=[])
+            stream._outputs_dict["hls"] = new_provider
+            assert stream.outputs()["hls"] is new_provider
+
+        event = Mock()
+        event.data = {
+            "entity_id": "camera.test_1",
+            "new_state": Mock(state="idle"),
+        }
+        await manager._async_handle_camera_state_change(event)
+
+        assert "camera.test_1" in manager.leases
+        lease = manager.leases["camera.test_1"]
+        assert lease.provider is stream.outputs()["hls"]
+        assert lease.provider is not hls_provider1
+        assert lease.stream is stream
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state_val", ["unavailable", "unknown", None])
+async def test_offline_camera_skips_acquisition_and_releases_stale_lease(state_val):
+    """Verify reconciliation consults hass.states and releases/skips offline or missing cameras."""
+    hass = Mock()
+    hass.is_running = True
+    state_mock = Mock(state=state_val) if state_val is not None else None
+    hass.states.get = Mock(return_value=state_mock)
+    entry = _make_entry(["camera.test_1"])
+
+    stream, hls_provider = _make_realistic_stream(preload_stream=False)
+    camera = Mock(async_create_stream=AsyncMock(return_value=stream), stream=stream)
+
+    manager = StreamBufferManager(hass, entry)
+    with patch.object(
+        importlib.import_module("homeassistant.components.camera"),
+        "get_camera_from_entity_id",
+        return_value=camera,
+    ):
+        # 1. Healthy start with state="idle"
+        hass.states.get.return_value = Mock(state="idle")
+        await manager.async_start()
+        assert "camera.test_1" in manager.leases
+
+        # 2. Camera goes offline / unknown / missing
+        hass.states.get.return_value = state_mock
+        camera.async_create_stream.reset_mock()
+
+        # Reconcile runs
+        await manager._async_reconcile_all()
+
+        # Lease is cleanly released and NOT re-acquired
+        assert "camera.test_1" not in manager.leases
+        camera.async_create_stream.assert_not_called()
+        assert stream.dynamic_stream_settings.preload_stream is False
+        hls_provider.idle_timer.start.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_healthy_lease_no_churn_on_state_change_and_reconcile():
+    """Verify that a healthy lease is retained without churn by state events or periodic reconciliation."""
+    hass = Mock()
+    hass.is_running = True
+    hass.states.get = Mock(return_value=Mock(state="idle"))
+    entry = _make_entry(["camera.test_1"])
+
+    stream, hls_provider = _make_realistic_stream(preload_stream=False)
+    camera = Mock(async_create_stream=AsyncMock(return_value=stream), stream=stream)
+
+    manager = StreamBufferManager(hass, entry)
+    with patch.object(
+        importlib.import_module("homeassistant.components.camera"),
+        "get_camera_from_entity_id",
+        return_value=camera,
+    ):
+        await manager.async_start()
+        assert "camera.test_1" in manager.leases
+        lease_before = manager.leases["camera.test_1"]
+        assert camera.async_create_stream.call_count == 1
+
+        # 1. State change event with healthy new_state
+        event = Mock()
+        event.data = {
+            "entity_id": "camera.test_1",
+            "new_state": Mock(state="idle"),
+        }
+        await manager._async_handle_camera_state_change(event)
+
+        assert manager.leases["camera.test_1"] is lease_before
+        assert camera.async_create_stream.call_count == 1
+        assert hls_provider.idle_timer.start.call_count == 0
+
+        # 2. Periodic reconciliation
+        await manager._async_reconcile_all()
+
+        assert manager.leases["camera.test_1"] is lease_before
+        assert camera.async_create_stream.call_count == 1
+        assert hls_provider.idle_timer.start.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_in_flight_stop_cancellation_rollback_and_no_post_stop():
+    """Verify in-flight stop cancels reconcile task, triggers rollback, and prevents post-stop acquisition."""
+    hass = Mock()
+    hass.is_running = True
+    entry = _make_entry(["camera.test_1"])
+
+    stream, hls_provider = _make_realistic_stream(preload_stream=False)
+    camera = Mock(async_create_stream=AsyncMock(return_value=stream), stream=stream)
+
+    gate = asyncio.Event()
+
+    async def _blocking_stream_start():
+        gate.set()
+        await asyncio.sleep(10)
+
+    stream.start = AsyncMock(side_effect=_blocking_stream_start)
+
+    manager = StreamBufferManager(hass, entry)
+    with patch.object(
+        importlib.import_module("homeassistant.components.camera"),
+        "get_camera_from_entity_id",
+        return_value=camera,
+    ):
+        manager.is_active = True
+        reconcile_task = asyncio.create_task(
+            manager._async_reconcile_camera("camera.test_1")
+        )
+        manager._reconcile_task = reconcile_task
+
+        await gate.wait()
+        # Stream preload was set before start
+        assert stream.dynamic_stream_settings.preload_stream is True
+
+        # Stop manager while reconciliation is blocked in stream.start()
+        await manager.async_stop()
+
+        # Task was cancelled, rollback occurred
+        assert manager.is_active is False
+        assert len(manager.leases) == 0
+        assert stream.dynamic_stream_settings.preload_stream is False
+        hls_provider.idle_timer.start.assert_called_once()
+
+        # Post-stop queued tick or callback must not acquire
+        manager._on_reconcile_interval()
+        assert manager._reconcile_task is None
+        await manager._async_reconcile_camera("camera.test_1")
+        assert len(manager.leases) == 0
+
+
+@pytest.mark.asyncio
+async def test_shared_stream_preload_preserved_during_recovery_and_stop():
+    """Verify that if stream originally had preload_stream=True, recovery and stop preserve it."""
+    hass = Mock()
+    hass.is_running = True
+    hass.states.get = Mock(return_value=Mock(state="idle"))
+    entry = _make_entry(["camera.test_shared"])
+
+    stream, hls_provider1 = _make_realistic_stream(preload_stream=True)
+    camera = Mock(async_create_stream=AsyncMock(return_value=stream), stream=stream)
+
+    manager = StreamBufferManager(hass, entry)
+    with patch.object(
+        importlib.import_module("homeassistant.components.camera"),
+        "get_camera_from_entity_id",
+        return_value=camera,
+    ):
+        await manager.async_start()
+        assert manager.leases["camera.test_shared"].original_preload is True
+        assert stream.dynamic_stream_settings.preload_stream is True
+
+        # Invalidate outputs to trigger recovery
+        stream._outputs_dict.clear()
+        await manager._async_reconcile_all()
+
+        # Preload_stream must remain True, idle_timer never started
+        assert stream.dynamic_stream_settings.preload_stream is True
+        assert hls_provider1.idle_timer.start.call_count == 0
+        assert manager.leases["camera.test_shared"].original_preload is True
+
+        # Stop manager
+        await manager.async_stop()
+
+        # Still preserved! Must NOT stop or arm idle timer for shared stream
+        assert stream.dynamic_stream_settings.preload_stream is True
+        assert hls_provider1.idle_timer.start.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_async_start_race_with_async_stop_no_listener_leak():
+    """Verify that when async_stop is called while async_start awaits stream.start, listeners do not leak."""
+    hass = Mock()
+    hass.is_running = True
+    entry = _make_entry(["camera.test_1"])
+
+    stream, hls_provider = _make_realistic_stream(preload_stream=False)
+    camera = Mock(async_create_stream=AsyncMock(return_value=stream), stream=stream)
+
+    start_barrier = asyncio.Event()
+    release_barrier = asyncio.Event()
+
+    async def _blocking_stream_start():
+        start_barrier.set()
+        await release_barrier.wait()
+
+    stream.start = AsyncMock(side_effect=_blocking_stream_start)
+
+    manager = StreamBufferManager(hass, entry)
+    with patch.object(
+        importlib.import_module("homeassistant.components.camera"),
+        "get_camera_from_entity_id",
+        return_value=camera,
+    ), patch(
+        "custom_components.llmvision.stream_buffer.async_track_state_change_event"
+    ) as mock_track_state, patch(
+        "custom_components.llmvision.stream_buffer.async_track_time_interval"
+    ) as mock_track_interval:
+        # Start async_start in background
+        start_task = asyncio.create_task(manager.async_start())
+
+        # Wait until async_start reaches stream.start
+        await asyncio.wait_for(start_barrier.wait(), timeout=2.0)
+
+        # Launch stop while async_start is holding lock
+        stop_task = asyncio.create_task(manager.async_stop())
+
+        # Yield to allow async_stop to run up to lock acquisition (setting is_active = False)
+        await asyncio.sleep(0.01)
+        assert manager.is_active is False
+
+        # Release stream.start so async_start finishes acquisition loop
+        release_barrier.set()
+
+        # Await both tasks bounded
+        await asyncio.wait_for(asyncio.gather(start_task, stop_task), timeout=2.0)
+
+        # Assert clean state
+        assert manager.is_active is False
+        assert len(manager.leases) == 0
+        assert manager._unsub_reconcile is None
+        assert manager._unsub_state_change is None
+        assert manager._unsub_ha_started is None
+        assert manager._reconcile_task is None
+
+        # No listeners leaked during startup race
+        mock_track_state.assert_not_called()
+        mock_track_interval.assert_not_called()
+        assert stream.dynamic_stream_settings.preload_stream is False
+
+
+@pytest.mark.asyncio
+async def test_reconcile_interval_no_overlapping_tasks_and_stop_no_reacquire():
+    """Verify that multiple interval ticks do not create overlapping tasks and post-stop does not reacquire."""
+    hass = Mock()
+    hass.is_running = True
+    entry = _make_entry(["camera.test_1"])
+
+    stream, hls_provider = _make_realistic_stream(preload_stream=False)
+    camera = Mock(async_create_stream=AsyncMock(return_value=stream), stream=stream)
+
+    gate = asyncio.Event()
+
+    async def _blocking_reconcile():
+        gate.set()
+        await asyncio.sleep(10)
+
+    tasks_created = []
+
+    def _async_create_task(coro):
+        t = asyncio.create_task(coro)
+        tasks_created.append(t)
+        return t
+
+    hass.async_create_task = Mock(side_effect=_async_create_task)
+    hass.states.get = Mock(return_value=Mock(state="idle"))
+
+    manager = StreamBufferManager(hass, entry)
+    with patch.object(
+        importlib.import_module("homeassistant.components.camera"),
+        "get_camera_from_entity_id",
+        return_value=camera,
+    ):
+        await manager.async_start()
+        hass.async_create_task.reset_mock()
+        tasks_created.clear()
+
+        # Patch _async_reconcile_all to block
+        with patch.object(
+            manager, "_async_reconcile_all", side_effect=_blocking_reconcile
+        ):
+            # First tick creates a task
+            manager._on_reconcile_interval()
+            assert hass.async_create_task.call_count == 1
+            await gate.wait()
+
+            # Second tick while first is still running must NOT create another task
+            manager._on_reconcile_interval()
+            assert hass.async_create_task.call_count == 1
+
+        # Stop manager cancels running task and clears reference
+        await manager.async_stop()
+        assert manager.is_active is False
+        assert manager._reconcile_task is None
+        assert len(manager.leases) == 0
+
+        # Post-stop tick does nothing
+        manager._on_reconcile_interval()
+        assert hass.async_create_task.call_count == 1
+        assert manager._reconcile_task is None
+
+
+@pytest.mark.asyncio
+async def test_strict_validation_after_missing_recovery_empty_segments_fails():
+    """Verify that after recovering from missing provider, validate_lookback strictly rejects if segments are empty."""
+    hass = Mock()
+    hass.is_running = True
+    entry = _make_entry(["camera.test_1"], buffer_seconds=30)
+
+    stream, hls_provider1 = _make_realistic_stream(preload_stream=False)
+    camera = Mock(async_create_stream=AsyncMock(return_value=stream), stream=stream)
+
+    manager = StreamBufferManager(hass, entry)
+    with patch.object(
+        importlib.import_module("homeassistant.components.camera"),
+        "get_camera_from_entity_id",
+        return_value=camera,
+    ):
+        await manager.async_start()
+
+        # Invalidate outputs (missing provider)
+        stream._outputs_dict.clear()
+
+        # Reconcile acquires a new provider via add_provider, but that new provider has empty segments
+        await manager._async_reconcile_all()
+
+        assert "camera.test_1" in manager.leases
+        lease = manager.leases["camera.test_1"]
+        assert lease.provider is stream.outputs()["hls"]
+        assert lease.provider is not hls_provider1
+
+        # 0s lookback succeeds
+        manager.validate_lookback(["camera.test_1"], 0)
+
+        # Positive lookback must strictly raise ServiceValidationError due to empty segments (stream warming up)
+        with pytest.raises(ServiceValidationError, match="warming up"):
+            manager.validate_lookback(["camera.test_1"], 5)
+
+
+@pytest.mark.asyncio
+async def test_error_isolation_failed_camera_first_healthy_camera_second():
+    """Verify that failure on first camera does not abort reconciliation of second camera, and Cancellation is not swallowed."""
+    hass = Mock()
+    hass.is_running = True
+    entry = _make_entry(["camera.cam1_failing", "camera.cam2_healthy"])
+
+    stream1, hls1 = _make_realistic_stream(preload_stream=False)
+    stream2, hls2 = _make_realistic_stream(preload_stream=False)
+
+    cam1 = Mock(
+        async_create_stream=AsyncMock(side_effect=RuntimeError("Cam1 hardware down")),
+        stream=stream1,
+    )
+    cam2 = Mock(async_create_stream=AsyncMock(return_value=stream2), stream=stream2)
+
+    def _get_camera(hass_obj, entity_id):
+        if entity_id == "camera.cam1_failing":
+            return cam1
+        if entity_id == "camera.cam2_healthy":
+            return cam2
+        return None
+
+    manager = StreamBufferManager(hass, entry)
+    with patch.object(
+        importlib.import_module("homeassistant.components.camera"),
+        "get_camera_from_entity_id",
+        side_effect=_get_camera,
+    ):
+        # Startup attempts both: cam1 fails, cam2 succeeds
+        await manager.async_start()
+
+        assert "camera.cam1_failing" not in manager.leases
+        assert "camera.cam2_healthy" in manager.leases
+        assert (
+            manager.leases["camera.cam2_healthy"].provider
+            is stream2.outputs()["hls"]
+        )
+
+        # Run reconciliation: cam1 still fails, cam2 must still be checked and remain healthy
+        await manager._async_reconcile_all()
+
+        assert "camera.cam1_failing" not in manager.leases
+        assert "camera.cam2_healthy" in manager.leases
+        assert (
+            manager.leases["camera.cam2_healthy"].provider
+            is stream2.outputs()["hls"]
+        )
+
+        # Verify CancelledError in cam1 is NOT swallowed, but propagates
+        with patch.object(
+            cam1, "async_create_stream", side_effect=asyncio.CancelledError()
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await manager._async_reconcile_all()

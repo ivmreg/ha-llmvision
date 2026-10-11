@@ -3,13 +3,17 @@
 import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 from typing import Any
 
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
+from homeassistant.core import callback
 from homeassistant.exceptions import ServiceValidationError
-from homeassistant.helpers.event import async_track_state_change_event
+from homeassistant.helpers.event import (
+    async_track_state_change_event,
+    async_track_time_interval,
+)
 from homeassistant.util import dt as dt_util
 
 from .const import (
@@ -25,6 +29,8 @@ try:
     from homeassistant.components.stream.const import MAX_SEGMENTS
 except ImportError:
     MAX_SEGMENTS = None
+
+DEFAULT_RECONCILE_INTERVAL_SECONDS = 30
 
 
 @dataclass
@@ -51,6 +57,8 @@ class StreamBufferManager:
         self._lock = asyncio.Lock()
         self._unsub_state_change = None
         self._unsub_ha_started = None
+        self._unsub_reconcile = None
+        self._reconcile_task: asyncio.Task | None = None
 
     @property
     def buffered_cameras(self) -> list[str]:
@@ -81,6 +89,9 @@ class StreamBufferManager:
                 for camera_entity in self.buffered_cameras:
                     await self._async_acquire_stream(camera_entity)
 
+                if not self.is_active:
+                    return
+
                 # Retry after Home Assistant startup if not currently running
                 if not getattr(self.hass, "is_running", True):
                     self._unsub_ha_started = self.hass.bus.async_listen_once(
@@ -100,9 +111,27 @@ class StreamBufferManager:
                             "LLM Vision: Could not register camera state listener: %s",
                             e,
                         )
+
+                    try:
+                        self._unsub_reconcile = async_track_time_interval(
+                            self.hass,
+                            self._on_reconcile_interval,
+                            timedelta(seconds=DEFAULT_RECONCILE_INTERVAL_SECONDS),
+                        )
+                    except Exception as e:
+                        _LOGGER.debug(
+                            "LLM Vision: Could not register periodic stream reconciler: %s",
+                            e,
+                        )
             except BaseException:
                 # Rollback all prior leases and cleanup state on cancellation or fatal error during startup
                 self.is_active = False
+                if self._unsub_reconcile:
+                    try:
+                        self._unsub_reconcile()
+                    except Exception:
+                        pass
+                    self._unsub_reconcile = None
                 if self._unsub_state_change:
                     try:
                         self._unsub_state_change()
@@ -115,10 +144,104 @@ class StreamBufferManager:
                     except Exception:
                         pass
                     self._unsub_ha_started = None
+                if self._reconcile_task is not None and not self._reconcile_task.done():
+                    self._reconcile_task.cancel()
+                    try:
+                        await self._reconcile_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    self._reconcile_task = None
                 for camera_entity in list(self.leases.keys()):
                     await self.async_release_camera(camera_entity)
                 self.leases.clear()
                 raise
+
+    @callback
+    def _on_reconcile_interval(self, now: Any = None) -> None:
+        """Periodic callback to schedule background stream reconciliation."""
+        if not self.is_active:
+            return
+        if self._reconcile_task is not None and not self._reconcile_task.done():
+            return
+        self._reconcile_task = self.hass.async_create_task(self._async_reconcile_all())
+
+    async def _async_reconcile_all(self) -> None:
+        """Reconcile stream leases for all configured cameras to detect invalidations without state events."""
+        for camera_entity in self.buffered_cameras:
+            if not self.is_active:
+                break
+            try:
+                await self._async_reconcile_camera(camera_entity)
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:
+                _LOGGER.debug(
+                    "LLM Vision: Error reconciling camera %s: %s",
+                    camera_entity,
+                    err,
+                )
+
+    async def _async_reconcile_camera(
+        self, camera_entity: str, new_state: Any = None
+    ) -> None:
+        """Reconcile a single camera stream lease against current state and outputs."""
+        async with self._lock:
+            if not self.is_active:
+                return
+
+            # Consult entity state (from state event or hass.states)
+            state_obj = (
+                new_state
+                if new_state is not None
+                else self.hass.states.get(camera_entity)
+            )
+            state_val = getattr(state_obj, "state", None) if state_obj is not None else None
+
+            if state_obj is None or state_val in ("unavailable", "unknown"):
+                # Camera is offline, unknown, or missing; release lease cleanly and do not acquire
+                if camera_entity in self.leases:
+                    await self.async_release_camera(camera_entity)
+                return
+
+            existing_lease = self.leases.get(camera_entity)
+            if existing_lease is not None:
+                try:
+                    from homeassistant.components.camera import (
+                        get_camera_from_entity_id,
+                    )
+
+                    camera = get_camera_from_entity_id(self.hass, camera_entity)
+                    current_stream = getattr(camera, "stream", None)
+                    if (
+                        current_stream is not None
+                        and current_stream is existing_lease.stream
+                    ):
+                        outputs = (
+                            current_stream.outputs()
+                            if callable(current_stream.outputs)
+                            else getattr(current_stream, "outputs", {})
+                        )
+                        current_hls = (
+                            outputs.get("hls")
+                            if (
+                                isinstance(outputs, (dict, Mapping))
+                                or hasattr(outputs, "get")
+                            )
+                            else None
+                        )
+                        if (
+                            current_hls is not None
+                            and current_hls is existing_lease.provider
+                        ):
+                            # Same stream instance and same active HLS provider; healthy lease, retain without churn
+                            return
+                except Exception:
+                    pass
+
+                # Stream was replaced, camera reloaded, or HLS provider missing/replaced; release old lease cleanly
+                await self.async_release_camera(camera_entity)
+
+            await self._async_acquire_stream(camera_entity)
 
     async def _async_on_ha_started(self, event=None) -> None:
         """Handle Home Assistant started event to retry stream acquisition."""
@@ -132,47 +255,16 @@ class StreamBufferManager:
 
     async def _async_handle_camera_state_change(self, event) -> None:
         """Handle state change events for configured cameras."""
-        async with self._lock:
-            if not self.is_active:
-                return
+        if not self.is_active:
+            return
 
-            event_data = getattr(event, "data", {})
-            entity_id = event_data.get("entity_id")
-            if not entity_id or entity_id not in self.buffered_cameras:
-                return
+        event_data = getattr(event, "data", {})
+        entity_id = event_data.get("entity_id")
+        if not entity_id or entity_id not in self.buffered_cameras:
+            return
 
-            new_state = event_data.get("new_state")
-            if new_state is None or getattr(new_state, "state", None) in (
-                "unavailable",
-                "unknown",
-            ):
-                # Camera became unavailable; release old lease cleanly
-                await self.async_release_camera(entity_id)
-                return
-
-            # Check if camera still has the same active native stream instance
-            existing_lease = self.leases.get(entity_id)
-            if existing_lease is not None:
-                try:
-                    from homeassistant.components.camera import (
-                        get_camera_from_entity_id,
-                    )
-
-                    camera = get_camera_from_entity_id(self.hass, entity_id)
-                    current_stream = getattr(camera, "stream", None)
-                    if (
-                        current_stream is not None
-                        and current_stream is existing_lease.stream
-                    ):
-                        # Same stream instance; retain lease without churn
-                        return
-                except Exception:
-                    pass
-
-                # Stream was replaced or camera reloaded; release old lease cleanly
-                await self.async_release_camera(entity_id)
-
-            await self._async_acquire_stream(entity_id)
+        new_state = event_data.get("new_state")
+        await self._async_reconcile_camera(entity_id, new_state=new_state)
 
     async def _async_acquire_stream(self, camera_entity: str) -> None:
         """Acquire or borrow an HLS stream provider for a camera entity with active guards."""
@@ -345,7 +437,24 @@ class StreamBufferManager:
         """Stop all stream keepers and unsubscribe listeners."""
         # Set is_active False BEFORE waiting for lock so queued startup/callbacks abort early
         self.is_active = False
+
+        # Cancel and await owned reconciliation task BEFORE waiting for lock
+        if self._reconcile_task is not None and not self._reconcile_task.done():
+            self._reconcile_task.cancel()
+            try:
+                await self._reconcile_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._reconcile_task = None
+
         async with self._lock:
+            if self._unsub_reconcile:
+                try:
+                    self._unsub_reconcile()
+                except Exception:
+                    pass
+                self._unsub_reconcile = None
+
             if self._unsub_state_change:
                 try:
                     self._unsub_state_change()
